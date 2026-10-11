@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build Outputs & Bundles
+*.tsbuildinfo
+*.js.map
+*.d.ts.map
+
+# Serverless & Bundler Caches
+.wrangler/
+.turbo/
+.cache/
+.esbuild/
+
+# Local secrets & configs
+.env
+.env.*
+!.env.example
+.omnirush2api/
+
+# Logs & Debugging
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
