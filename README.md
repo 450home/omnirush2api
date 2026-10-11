@@ -25,6 +25,11 @@
 
 - [What is Omnirush2API?](#what-is-omnirush2api)
 - [Key Features](#key-features)
+- [How to Get Your Refresh Token](#how-to-get-your-refresh-token)
+  - [1. Automated Script (1-Click Browser Login)](#1-automated-script-recommended---1-click-login)
+  - [2. For Method 1: Local Daemon](#2-for-method-1-local-daemon)
+  - [3. For Method 2: Cloudflare Workers](#3-for-method-2-cloudflare-workers-serverless)
+  - [4. Extracting from OmniRush Desktop App Files](#4-extracting-from-omnirush-desktop-app-files-manual-method)
 - [Quick Start](#quick-start)
   - [Method 1: Local Daemon](#method-1-local-daemon)
   - [Method 2: Cloudflare Workers (Serverless)](#method-2-cloudflare-workers-serverless)
@@ -68,6 +73,123 @@ However, access to Omnirush quotas is locked behind OAuth device authentication 
   - 120-second upstream timeout guards against stalled connections.
   - 25MB request payload limit protects against buffer exhaustion attacks.
   - Atomic token persistence using secure `0o600` file permissions.
+
+## How to Get Your Refresh Token
+
+Omnirush uses OAuth 2.0 refresh tokens to authorize API requests. You can obtain your refresh token automatically using the built-in login script, or extract it from the OmniRush Desktop app.
+
+### 1. Automated Script (Recommended - 1-Click Login)
+
+The easiest way to get your refresh token is to run the automated login script:
+
+```bash
+npm run login
+```
+
+Or using the CLI:
+
+```bash
+node dist/cli.js login
+```
+
+Or directly via npx:
+
+```bash
+npx omnirush2api login
+```
+
+**What the script does automatically:**
+1. Requests an official OAuth Device Authorization session from Omnirush.
+2. Automatically launches your default web browser to the verification page with your code pre-filled.
+3. Polls the backend securely in the background while you click **"Authorize"** in the browser.
+4. Once authorized, **prints your full refresh token in the terminal** so you can easily copy it for Cloudflare Workers.
+5. Automatically saves the token to `~/.omnirush2api/tokens.json` for the local daemon.
+
+```text
+================================================================================
+🎉 Omnirush OAuth Login Successful!
+================================================================================
+
+Your Refresh Token (Copy this for Cloudflare Worker secret OMNIRUSH_REFRESH_TOKEN):
+--------------------------------------------------------------------------------
+omni_ref_a1b2c3d4e5f6...
+--------------------------------------------------------------------------------
+
+✓ Account:          developer@example.com (active)
+✓ Tokens Remaining: 4,875,000
+✓ Saved to Disk:    ~/.omnirush2api/tokens.json
+```
+
+---
+
+### 2. For Method 1: Local Daemon
+
+When running the **Local Daemon**, getting and managing the refresh token is **completely automatic**:
+
+- **Option A (Interactive Login)**: Run `npm run login` or `node dist/cli.js login`. The token is automatically persisted to `~/.omnirush2api/tokens.json`. You can start the daemon immediately with `node dist/cli.js start`.
+- **Option B (Auto-Discovery from Desktop App)**: If you already have the official [OmniRush Desktop](https://omnirush.ai) app installed and signed in, Omnirush2API **automatically discovers** your existing session from your system with zero setup. Run `node dist/cli.js check` to verify detection.
+- **Option C (Environment Variable)**: Export the token directly:
+  ```bash
+  export OMNIRUSH_REFRESH_TOKEN="omni_ref_your_token_here"
+  node dist/cli.js start
+  ```
+
+---
+
+### 3. For Method 2: Cloudflare Workers (Serverless)
+
+When deploying to **Cloudflare Workers**, you need your raw refresh token to set as an edge secret:
+
+1. **Obtain the token**:
+   Run the login script:
+   ```bash
+   npm run login
+   ```
+   Or view all currently stored tokens:
+   ```bash
+   npm run tokens
+   # or: node dist/cli.js tokens list
+   ```
+2. **Copy the token**:
+   Copy the `omni_ref_...` token printed in your terminal.
+3. **Add as Worker Secret**:
+   In the [Cloudflare Dashboard](https://dash.cloudflare.com):
+   - Navigate to **Workers & Pages** -> your `omnirush2api` Worker -> **Settings** -> **Variables and Secrets**.
+   - Under **Secrets**, click **Add**.
+   - Name: `OMNIRUSH_REFRESH_TOKEN`
+   - Value: Paste your copied refresh token.
+   - Click **Save and deploy**.
+
+> **Pro Tip (Multi-Account Pooling)**: You can paste multiple refresh tokens (one per line) into `OMNIRUSH_REFRESH_TOKEN`. Omnirush2API will automatically round-robin requests across all accounts and failover on 429 rate limits!
+
+---
+
+### 4. Extracting from OmniRush Desktop App Files (Manual Method)
+
+If you have signed into the OmniRush Desktop app on your computer, your refresh token is stored in the following locations:
+
+- **Windows**:
+  - `%APPDATA%\OmniRush\credentials`
+  - `%APPDATA%\OmniRush\credentials.fallback` (Plaintext fallback JSON)
+- **macOS**:
+  - `~/Library/Application Support/OmniRush/credentials`
+  - macOS Keychain service: `ai.omnirush.desktop.gateway-refresh`
+- **Linux**:
+  - `~/.config/OmniRush/credentials`
+  - `~/.config/OmniRush/credentials.fallback`
+
+The credentials file contains JSON:
+```json
+{
+  "refresh_token": "omni_ref_...",
+  "access_token": "omni_acc_...",
+  "gateway_url": "https://omnirush.ai/omnirush/v1",
+  "email": "user@example.com"
+}
+```
+You can copy the `"refresh_token"` value directly.
+
+---
 
 ## Quick Start
 

@@ -1172,20 +1172,39 @@ async function runStartCommand(options = {}) {
 }
 
 // src/cli/commands/login.ts
+import { exec } from "node:child_process";
+function launchBrowser(url) {
+  const platform = process.platform;
+  let command = "";
+  if (platform === "win32") {
+    command = `start "" "${url}"`;
+  } else if (platform === "darwin") {
+    command = `open "${url}"`;
+  } else {
+    command = `xdg-open "${url}"`;
+  }
+  exec(command, () => {
+  });
+}
 async function runLoginCommand(options = {}) {
   const gatewayUrl = options.gatewayUrl || DEFAULT_GATEWAY_URL;
+  const shouldOpenBrowser = options.openBrowser ?? true;
   console.log("\n==================================================");
   console.log("       Omnirush2API - Device OAuth Login          ");
   console.log("==================================================\n");
   console.log(`[Omnirush2API] Connecting to gateway: ${gatewayUrl}`);
   try {
     const authSession = await initiateDeviceFlow({ gatewayUrl });
-    console.log("\n1. Open the following verification URL in your browser:\n");
+    console.log("\n1. Verification URL:\n");
     console.log(`   ${authSession.verification_uri_complete}
 `);
-    console.log(`2. Verify the code matches: [ ${authSession.user_code} ]
+    console.log(`2. User Verification Code: [ ${authSession.user_code} ]
 `);
-    console.log("3. Click 'Authorize' in your browser.\n");
+    if (shouldOpenBrowser) {
+      console.log("-> Opening verification link in your default browser...");
+      launchBrowser(authSession.verification_uri_complete);
+    }
+    console.log("\n3. Click 'Authorize' in your browser.");
     console.log(`Waiting for approval (expires in ${Math.round(authSession.expires_in / 60)} minutes)...`);
     const tokenResult = await pollDeviceToken(authSession.device_code, {
       gatewayUrl,
@@ -1197,16 +1216,16 @@ async function runLoginCommand(options = {}) {
       process.exitCode = 1;
       return;
     }
-    console.log("\n\u2713 Authorization approved by browser!");
+    console.log("\n\u2713 Authorization approved by browser!\n");
     let email;
+    let plan = "active";
+    let remainingTokens;
     if (tokenResult.accessToken) {
       const profile = await fetchAccountProfile(tokenResult.accessToken, gatewayUrl);
       if (profile) {
         email = profile.email;
-        console.log(`\u2713 Account connected: ${profile.email ?? profile.id} (${profile.status})`);
-        if (profile.usage?.remaining_tokens !== void 0) {
-          console.log(`\u2713 Tokens remaining: ${profile.usage.remaining_tokens.toLocaleString()}`);
-        }
+        plan = profile.status;
+        remainingTokens = profile.usage?.remaining_tokens;
       }
     }
     await addOrUpdateToken({
@@ -1215,8 +1234,19 @@ async function runLoginCommand(options = {}) {
       gatewayUrl,
       email
     });
-    console.log("\u2713 Refresh token securely saved to ~/.omnirush2api/tokens.json\n");
-    console.log("You can now start the daemon using: omnirush2api start\n");
+    console.log("================================================================================");
+    console.log("\u{1F389} Omnirush OAuth Login Successful!");
+    console.log("================================================================================");
+    console.log("\nYour Refresh Token (Copy this for Cloudflare Worker secret OMNIRUSH_REFRESH_TOKEN):");
+    console.log("--------------------------------------------------------------------------------");
+    console.log(tokenResult.refreshToken);
+    console.log("--------------------------------------------------------------------------------\n");
+    if (email) console.log(`\u2713 Account:          ${email} (${plan})`);
+    if (remainingTokens !== void 0) console.log(`\u2713 Tokens Remaining: ${remainingTokens.toLocaleString()}`);
+    console.log("\u2713 Saved to Disk:    ~/.omnirush2api/tokens.json");
+    console.log("\nNext Steps:");
+    console.log("  \u2022 For Local Daemon:       node dist/cli.js start");
+    console.log("  \u2022 For Cloudflare Workers: Paste the token into your Worker's OMNIRUSH_REFRESH_TOKEN secret\n");
   } catch (err) {
     console.error(`
 \u274C Error during login: ${err instanceof Error ? err.message : String(err)}`);
@@ -1305,11 +1335,12 @@ Stored Tokens in ~/.omnirush2api/tokens.json (${tokens.length}):
       return;
     }
     tokens.forEach((t, i) => {
-      console.log(`  [${i + 1}] ${t.refreshToken.slice(0, 16)}...`);
-      if (t.email) console.log(`      Email: ${t.email}`);
-      if (t.gatewayUrl) console.log(`      Gateway: ${t.gatewayUrl}`);
+      console.log(`  [${i + 1}] Refresh Token:`);
+      console.log(`      ${t.refreshToken}`);
+      if (t.email) console.log(`      Email:         ${t.email}`);
+      if (t.gatewayUrl) console.log(`      Gateway:       ${t.gatewayUrl}`);
+      console.log("");
     });
-    console.log("");
     return;
   }
   if (op === "add") {

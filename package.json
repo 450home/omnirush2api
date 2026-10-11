@@ -19,7 +19,9 @@
     "test": "tsx --test tests/**/*.test.ts",
     "build": "tsx scripts/build.ts",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
-    "start": "tsx src/cli/index.ts start"
+    "start": "tsx src/cli/index.ts start",
+    "login": "tsx scripts/get-refresh-token.ts",
+    "tokens": "tsx src/cli/index.ts tokens"
   },
   "keywords": [
     "omnirush",

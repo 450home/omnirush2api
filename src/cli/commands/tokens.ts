@@ -16,11 +16,12 @@ export async function runTokensCommand(subcommand?: string, arg?: string): Promi
     }
 
     tokens.forEach((t, i) => {
-      console.log(`  [${i + 1}] ${t.refreshToken.slice(0, 16)}...`);
-      if (t.email) console.log(`      Email: ${t.email}`);
-      if (t.gatewayUrl) console.log(`      Gateway: ${t.gatewayUrl}`);
+      console.log(`  [${i + 1}] Refresh Token:`);
+      console.log(`      ${t.refreshToken}`);
+      if (t.email) console.log(`      Email:         ${t.email}`);
+      if (t.gatewayUrl) console.log(`      Gateway:       ${t.gatewayUrl}`);
+      console.log("");
     });
-    console.log("");
     return;
   }
 
