@@ -257,10 +257,34 @@ var AccountPoolManager = class {
     this.defaultGatewayUrl = defaultGatewayUrl;
   }
   /**
-   * Initializes the pool from a delimiter-separated token string (newlines, commas)
+   * Initializes the pool from a delimiter-separated token string (newlines, commas) or JSON array
    */
   initFromTokenList(tokenList) {
-    const tokens = tokenList.split(/[\r\n,]+/).map((t) => t.trim()).filter((t) => t.length > 0);
+    const trimmed = tokenList.trim();
+    if (!trimmed) return;
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            if (typeof item === "string" && item.trim()) {
+              this.addAccount(item.trim());
+            } else if (item && typeof item === "object") {
+              const rec = item;
+              const ref = typeof rec["refreshToken"] === "string" ? rec["refreshToken"] : typeof rec["refresh_token"] === "string" ? rec["refresh_token"] : null;
+              if (ref && ref.trim()) {
+                const gateway = typeof rec["gatewayUrl"] === "string" ? rec["gatewayUrl"] : typeof rec["gateway_url"] === "string" ? rec["gateway_url"] : void 0;
+                const email = typeof rec["email"] === "string" ? rec["email"] : void 0;
+                this.addAccount(ref.trim(), gateway, email);
+              }
+            }
+          }
+          return;
+        }
+      } catch {
+      }
+    }
+    const tokens = trimmed.split(/[\r\n,]+/).map((t) => t.trim().replace(/^["']|["']$/g, "")).filter((t) => t.length > 0);
     for (const token of tokens) {
       this.addAccount(token);
     }
@@ -1036,7 +1060,24 @@ async function findLocalCredentials(options = {}) {
   const seenTokens = /* @__PURE__ */ new Set();
   const envRefreshToken = process.env["OMNIRUSH_REFRESH_TOKEN"]?.trim();
   if (envRefreshToken) {
-    const tokens = envRefreshToken.split(/[\r\n,]+/).map((t) => t.trim()).filter(Boolean);
+    let tokens = [];
+    if (envRefreshToken.startsWith("[") && envRefreshToken.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(envRefreshToken);
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            const tok = typeof item === "string" ? item.trim() : item && typeof item === "object" ? item["refreshToken"] || item["refresh_token"] : null;
+            if (typeof tok === "string" && tok.trim()) {
+              tokens.push(tok.trim());
+            }
+          }
+        }
+      } catch {
+      }
+    }
+    if (tokens.length === 0) {
+      tokens = envRefreshToken.split(/[\r\n,]+/).map((t) => t.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+    }
     for (const tok of tokens) {
       if (!seenTokens.has(tok)) {
         seenTokens.add(tok);

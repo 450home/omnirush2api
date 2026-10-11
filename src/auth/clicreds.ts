@@ -114,8 +114,36 @@ export async function findLocalCredentials(
   // 1. Check environment variables
   const envRefreshToken = process.env["OMNIRUSH_REFRESH_TOKEN"]?.trim();
   if (envRefreshToken) {
-    // Can be comma or newline separated
-    const tokens = envRefreshToken.split(/[\r\n,]+/).map((t) => t.trim()).filter(Boolean);
+    let tokens: string[] = [];
+    if (envRefreshToken.startsWith("[") && envRefreshToken.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(envRefreshToken) as unknown;
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            const tok =
+              typeof item === "string"
+                ? item.trim()
+                : item && typeof item === "object"
+                  ? (item as Record<string, unknown>)["refreshToken"] ||
+                    (item as Record<string, unknown>)["refresh_token"]
+                  : null;
+            if (typeof tok === "string" && tok.trim()) {
+              tokens.push(tok.trim());
+            }
+          }
+        }
+      } catch {
+        // Fall back to delimiter splitting
+      }
+    }
+
+    if (tokens.length === 0) {
+      tokens = envRefreshToken
+        .split(/[\r\n,]+/)
+        .map((t) => t.trim().replace(/^["']|["']$/g, ""))
+        .filter(Boolean);
+    }
+
     for (const tok of tokens) {
       if (!seenTokens.has(tok)) {
         seenTokens.add(tok);

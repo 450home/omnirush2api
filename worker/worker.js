@@ -154,10 +154,34 @@ var AccountPoolManager = class {
     this.defaultGatewayUrl = defaultGatewayUrl;
   }
   /**
-   * Initializes the pool from a delimiter-separated token string (newlines, commas)
+   * Initializes the pool from a delimiter-separated token string (newlines, commas) or JSON array
    */
   initFromTokenList(tokenList) {
-    const tokens = tokenList.split(/[\r\n,]+/).map((t) => t.trim()).filter((t) => t.length > 0);
+    const trimmed = tokenList.trim();
+    if (!trimmed) return;
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            if (typeof item === "string" && item.trim()) {
+              this.addAccount(item.trim());
+            } else if (item && typeof item === "object") {
+              const rec = item;
+              const ref = typeof rec["refreshToken"] === "string" ? rec["refreshToken"] : typeof rec["refresh_token"] === "string" ? rec["refresh_token"] : null;
+              if (ref && ref.trim()) {
+                const gateway = typeof rec["gatewayUrl"] === "string" ? rec["gatewayUrl"] : typeof rec["gateway_url"] === "string" ? rec["gateway_url"] : void 0;
+                const email = typeof rec["email"] === "string" ? rec["email"] : void 0;
+                this.addAccount(ref.trim(), gateway, email);
+              }
+            }
+          }
+          return;
+        }
+      } catch {
+      }
+    }
+    const tokens = trimmed.split(/[\r\n,]+/).map((t) => t.trim().replace(/^["']|["']$/g, "")).filter((t) => t.length > 0);
     for (const token of tokens) {
       this.addAccount(token);
     }

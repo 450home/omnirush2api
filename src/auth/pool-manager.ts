@@ -53,12 +53,49 @@ export class AccountPoolManager {
   }
 
   /**
-   * Initializes the pool from a delimiter-separated token string (newlines, commas)
+   * Initializes the pool from a delimiter-separated token string (newlines, commas) or JSON array
    */
   public initFromTokenList(tokenList: string): void {
-    const tokens = tokenList
+    const trimmed = tokenList.trim();
+    if (!trimmed) return;
+
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            if (typeof item === "string" && item.trim()) {
+              this.addAccount(item.trim());
+            } else if (item && typeof item === "object") {
+              const rec = item as Record<string, unknown>;
+              const ref =
+                typeof rec["refreshToken"] === "string"
+                  ? rec["refreshToken"]
+                  : typeof rec["refresh_token"] === "string"
+                    ? rec["refresh_token"]
+                    : null;
+              if (ref && ref.trim()) {
+                const gateway =
+                  typeof rec["gatewayUrl"] === "string"
+                    ? rec["gatewayUrl"]
+                    : typeof rec["gateway_url"] === "string"
+                      ? rec["gateway_url"]
+                      : undefined;
+                const email = typeof rec["email"] === "string" ? rec["email"] : undefined;
+                this.addAccount(ref.trim(), gateway, email);
+              }
+            }
+          }
+          return;
+        }
+      } catch {
+        // Fallback to delimiter splitting
+      }
+    }
+
+    const tokens = trimmed
       .split(/[\r\n,]+/)
-      .map((t) => t.trim())
+      .map((t) => t.trim().replace(/^["']|["']$/g, ""))
       .filter((t) => t.length > 0);
 
     for (const token of tokens) {

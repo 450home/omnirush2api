@@ -14,6 +14,16 @@ describe("pool-manager", () => {
     assert.equal(parseCooldownDuration(), 3_600_000);
   });
 
+  it("initializes from JSON array and quoted tokens", () => {
+    const pool = new AccountPoolManager();
+    pool.initFromTokenList('["tok_json_1", "tok_json_2"]');
+    assert.equal(pool.getStats().total, 2);
+
+    const poolQuoted = new AccountPoolManager();
+    poolQuoted.initFromTokenList('"tok_q1", "tok_q2"');
+    assert.equal(poolQuoted.getStats().total, 2);
+  });
+
   it("rotates multiple accounts in round-robin fashion", async () => {
     const pool = new AccountPoolManager();
     pool.initFromTokenList("token_one, token_two\ntoken_three");
