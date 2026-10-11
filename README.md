@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./public/Omnirush2API_Banner.webp" alt="Omnirush2API Banner" width="100%">
+<img src="./public/images/Omnirush2API_Banner.webp" alt="Omnirush2API Banner" width="100%">
 
 # Omnirush2API
 
