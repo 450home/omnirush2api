@@ -190,59 +190,74 @@ export async function refreshDeviceToken(
 
   const gatewayUrl = options.gatewayUrl ?? DEFAULT_GATEWAY_URL;
   const controlPlaneUrl = getControlPlaneUrl(gatewayUrl);
+  const maxAttempts = 3;
+  let lastError = "";
 
-  try {
-    const response = await fetch(`${controlPlaneUrl}/device/refresh`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({ refresh_token: trimmed }),
-    });
-
-    const responseText = await response.text();
-    let data: Record<string, unknown> = {};
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      data = JSON.parse(responseText) as Record<string, unknown>;
-    } catch {
+      const response = await fetch(`${controlPlaneUrl}/device/refresh`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ refresh_token: trimmed }),
+      });
+
+      const responseText = await response.text();
+      let data: Record<string, unknown> = {};
+      try {
+        data = JSON.parse(responseText) as Record<string, unknown>;
+      } catch {
+        lastError = `Invalid JSON from refresh endpoint (${response.status}): ${responseText.slice(0, 150)}`;
+        if ([500, 502, 503, 504].includes(response.status) && attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
+          continue;
+        }
+        return { success: false, error: lastError };
+      }
+
+      if (!response.ok) {
+        const errorMsg =
+          (typeof data["error_description"] === "string" ? data["error_description"] : null) ??
+          (typeof data["error"] === "string" ? data["error"] : null) ??
+          (typeof data["detail"] === "string" ? data["detail"] : null) ??
+          `HTTP ${response.status}`;
+        lastError = errorMsg;
+        if ([500, 502, 503, 504].includes(response.status) && attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
+          continue;
+        }
+        return { success: false, error: errorMsg };
+      }
+
+      const accessToken = typeof data["access_token"] === "string" ? data["access_token"] : undefined;
+      const newRefreshToken =
+        typeof data["refresh_token"] === "string" ? data["refresh_token"] : trimmed;
+      const resolvedGatewayUrl =
+        typeof data["gateway_url"] === "string" ? data["gateway_url"] : gatewayUrl;
+
+      if (!accessToken) {
+        return { success: false, error: "Missing access_token in refresh response." };
+      }
+
       return {
-        success: false,
-        error: `Invalid JSON from refresh endpoint (${response.status}): ${responseText.slice(0, 150)}`,
+        success: true,
+        accessToken,
+        refreshToken: newRefreshToken,
+        gatewayUrl: resolvedGatewayUrl,
+        expiresIn: 3600,
       };
+    } catch (err) {
+      lastError = `Network error refreshing token: ${err instanceof Error ? err.message : String(err)}`;
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+        continue;
+      }
     }
-
-    if (!response.ok) {
-      const errorMsg =
-        (typeof data["error_description"] === "string" ? data["error_description"] : null) ??
-        (typeof data["error"] === "string" ? data["error"] : null) ??
-        `HTTP ${response.status}`;
-      return { success: false, error: errorMsg };
-    }
-
-    const accessToken = typeof data["access_token"] === "string" ? data["access_token"] : undefined;
-    const newRefreshToken =
-      typeof data["refresh_token"] === "string" ? data["refresh_token"] : trimmed;
-    const resolvedGatewayUrl =
-      typeof data["gateway_url"] === "string" ? data["gateway_url"] : gatewayUrl;
-
-    if (!accessToken) {
-      return { success: false, error: "Missing access_token in refresh response." };
-    }
-
-    return {
-      success: true,
-      accessToken,
-      refreshToken: newRefreshToken,
-      gatewayUrl: resolvedGatewayUrl,
-      expiresIn: 3600,
-    };
-  } catch (err) {
-    return {
-      success: false,
-      error: `Network error refreshing token: ${err instanceof Error ? err.message : String(err)}`,
-    };
   }
+
+  return { success: false, error: lastError || "Token refresh failed after retries." };
 }
 
 /**
