@@ -4,6 +4,10 @@ import type {
   TokenRefreshResult,
   AccountProfile,
 } from "../types/auth.js";
+import {
+  generateRealisticDeviceName,
+  detectPlatformSignature,
+} from "../proxy/wire-guard.js";
 
 export const DEFAULT_GATEWAY_URL = "https://omnirush.ai/omnirush/v1";
 
@@ -43,29 +47,53 @@ export async function initiateDeviceFlow(
 ): Promise<DeviceAuthorizeResponse> {
   const {
     gatewayUrl = DEFAULT_GATEWAY_URL,
-    deviceName = "Omnirush2API Tunnel",
-    platform = "node",
+    deviceName = generateRealisticDeviceName(),
+    platform = detectPlatformSignature(),
   } = options;
 
   const controlPlaneUrl = getControlPlaneUrl(gatewayUrl);
-  const response = await fetch(`${controlPlaneUrl}/device/authorize`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({
-      device_name: deviceName,
-      platform,
-    }),
-  });
+  const maxAttempts = 4;
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(`Device authorization failed (${response.status}): ${errorText.slice(0, 200)}`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(`${controlPlaneUrl}/device/authorize`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          device_name: deviceName,
+          platform,
+        }),
+      });
+
+      if (response.ok) {
+        return (await response.json()) as DeviceAuthorizeResponse;
+      }
+
+      const errorText = await response.text().catch(() => "");
+      const isRetryable = [500, 502, 503, 504].includes(response.status);
+      lastError = new Error(
+        `Device authorization failed (${response.status}): ${errorText.slice(0, 200)}`
+      );
+
+      if (!isRetryable || attempt === maxAttempts) {
+        throw lastError;
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt === maxAttempts) {
+        throw lastError;
+      }
+    }
+
+    // Exponential backoff on upstream 5xx errors (1s, 2s, 3s)
+    await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
   }
 
-  return (await response.json()) as DeviceAuthorizeResponse;
+  throw lastError ?? new Error("Device authorization timed out.");
 }
 
 export interface PollDeviceTokenOptions {

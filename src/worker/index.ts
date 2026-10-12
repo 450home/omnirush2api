@@ -70,17 +70,19 @@ export default {
     // Route: GET /v1/health or /health or /
     if (request.method === "GET" && (pathname === "/v1/health" || pathname === "/health" || pathname === "/")) {
       const stats = pool.getStats();
+      const isBanned = stats.total > 0 && stats.banned === stats.total;
       const isDegraded = stats.total > 0 && stats.active === 0;
       const isUnhealthy = stats.total === 0;
 
       return jsonResponse({
-        status: isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
+        status: isBanned ? "banned" : isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
         version: "1.0.0",
         mode: "cloudflare-worker",
         api_key_configured: Boolean(env.API_KEY && env.API_KEY.trim() !== ""),
         account_count: stats.total,
         active_accounts: stats.active,
         cooldown_accounts: stats.inCooldown,
+        banned_accounts: stats.banned,
         supported_models: ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol"],
       });
     }

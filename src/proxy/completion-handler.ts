@@ -7,6 +7,7 @@ import { AccountPoolManager, parseCooldownDuration } from "../auth/pool-manager.
 import { normalizeCompletionRequest, normalizeCompletionResponse } from "./normalizer.js";
 import { createSSETransformStream } from "./stream-transformer.js";
 import { DEFAULT_GATEWAY_URL } from "../auth/oauth-client.js";
+import { createAntiBanHeaders, detectAccountBan } from "./wire-guard.js";
 
 function generateRequestId(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {
@@ -72,6 +73,22 @@ export class CompletionProxyHandler {
 
       const account = await this.pool.getNextAvailableAccount();
       if (!account) {
+        const stats = this.pool.getStats();
+        if (stats.banned > 0 && stats.active === 0) {
+          return {
+            status: 403,
+            isStream: false,
+            errorResponse: {
+              error: {
+                message:
+                  "OmniRush account was closed or suspended by upstream (unofficial client / multi-session detection). Account quarantined.",
+                type: "account_suspended_error",
+                code: "account_banned_by_upstream",
+              },
+            },
+          };
+        }
+
         return {
           status: 429,
           isStream: false,
@@ -88,41 +105,26 @@ export class CompletionProxyHandler {
       const requestId = generateRequestId();
       const gatewayUrl = (account.gatewayUrl || this.upstreamBaseUrl).replace(/\/+$/, "");
 
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        Accept: isStream ? "text/event-stream" : "application/json",
-        Authorization: `Bearer ${account.accessToken}`,
-        "X-OmniRush-Client": "omnirush2api/1.0.0",
-        "x-omnirush-client-request-id": requestId,
-      };
+      const headers = createAntiBanHeaders({
+        accessToken: account.accessToken ?? "",
+        requestId,
+        isStream,
+      });
 
       const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
       const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 
       try {
-        const response = await fetch(`${gatewayUrl}/responses`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(normalizedPayload),
-          signal: combinedSignal,
+        const response = await this.pool.withAccountLock(account.id, async () => {
+          return await fetch(`${gatewayUrl}/responses`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(normalizedPayload),
+            signal: combinedSignal,
+          });
         });
 
-        // 401 Unauthorized: token might be revoked or rotated
-        if (response.status === 401) {
-          this.pool.markCooldown(account.id, 60_000, "HTTP 401 Unauthorized");
-          continue;
-        }
-
-        // 429 Rate Limit / Quota Exceeded
-        if (response.status === 429) {
-          const retryAfter = response.headers.get("retry-after");
-          const bodyText = await response.text().catch(() => "");
-          const cooldownMs = parseCooldownDuration(retryAfter, bodyText);
-          this.pool.markCooldown(account.id, cooldownMs, `HTTP 429: ${bodyText.slice(0, 100)}`);
-          continue;
-        }
-
-        // Handle streaming response
+        // Handle streaming response if successful
         if (isStream && response.ok && response.body) {
           const transformedStream = response.body.pipeThrough(
             createSSETransformStream(targetModel)
@@ -134,8 +136,31 @@ export class CompletionProxyHandler {
           };
         }
 
-        // Handle non-streaming response
+        // Read response body for status checks and error parsing
         const responseText = await response.text();
+
+        // 1. Check for Account Ban / Suspension (e.g. 403 / 401 with closure notice)
+        const banCheck = detectAccountBan(response.status, responseText);
+        if (banCheck.isBanned) {
+          this.pool.markBanned(account.id, banCheck.reason);
+          continue;
+        }
+
+        // 2. 401 Unauthorized: token might be revoked or expired
+        if (response.status === 401) {
+          this.pool.markCooldown(account.id, 60_000, "HTTP 401 Unauthorized");
+          continue;
+        }
+
+        // 3. 429 Rate Limit / Quota Exceeded
+        if (response.status === 429) {
+          const retryAfter = response.headers.get("retry-after");
+          const cooldownMs = parseCooldownDuration(retryAfter, responseText);
+          this.pool.markCooldown(account.id, cooldownMs, `HTTP 429: ${responseText.slice(0, 100)}`);
+          continue;
+        }
+
+        // Handle non-streaming response
         let parsedJson: unknown = {};
         try {
           parsedJson = JSON.parse(responseText);

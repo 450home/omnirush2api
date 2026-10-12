@@ -38,6 +38,7 @@ export interface PoolStats {
   readonly total: number;
   readonly active: number;
   readonly inCooldown: number;
+  readonly banned: number;
 }
 
 /**
@@ -131,12 +132,50 @@ export class AccountPoolManager {
     });
   }
 
+  private locks = new Map<string, Promise<void>>();
+
+  /**
+   * Executes an action under a per-account mutual exclusion lock to prevent concurrent sessions
+   */
+  public async withAccountLock<T>(accountId: string, fn: () => Promise<T>): Promise<T> {
+    while (this.locks.has(accountId)) {
+      await this.locks.get(accountId);
+    }
+    let resolveLock!: () => void;
+    const lockPromise = new Promise<void>((res) => {
+      resolveLock = res;
+    });
+    this.locks.set(accountId, lockPromise);
+
+    try {
+      return await fn();
+    } finally {
+      this.locks.delete(accountId);
+      resolveLock();
+    }
+  }
+
+  /**
+   * Marks an account as permanently banned / suspended, quarantining it from the pool
+   */
+  public markBanned(accountId: string, reason?: string): void {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+
+    account.isBanned = true;
+    account.bannedReason = reason ?? "Account suspended/closed by upstream";
+    account.cooldownUntil = Number.MAX_SAFE_INTEGER;
+    console.error(
+      `[Omnirush2API Guard] 🚨 DANGER: Account ${account.id} was permanently BANNED/SUSPENDED by Omnirush: ${account.bannedReason}. Quarantined from pool.`
+    );
+  }
+
   /**
    * Marks an account as in cooldown for specified duration
    */
   public markCooldown(accountId: string, durationMs: number, reason?: string): void {
     const account = this.accounts.find((a) => a.id === accountId);
-    if (!account) return;
+    if (!account || account.isBanned) return;
 
     account.cooldownUntil = Date.now() + durationMs;
     account.failureCount++;
@@ -156,7 +195,7 @@ export class AccountPoolManager {
     for (let i = 0; i < total; i++) {
       const idx = (this.currentIndex + i) % total;
       const candidate = this.accounts[idx];
-      if (!candidate) continue;
+      if (!candidate || candidate.isBanned) continue;
 
       if (now < candidate.cooldownUntil) {
         continue;
@@ -201,9 +240,12 @@ export class AccountPoolManager {
     const now = Date.now();
     let active = 0;
     let inCooldown = 0;
+    let banned = 0;
 
     for (const account of this.accounts) {
-      if (now < account.cooldownUntil) {
+      if (account.isBanned) {
+        banned++;
+      } else if (now < account.cooldownUntil) {
         inCooldown++;
       } else {
         active++;
@@ -214,6 +256,7 @@ export class AccountPoolManager {
       total: this.accounts.length,
       active,
       inCooldown,
+      banned,
     };
   }
 

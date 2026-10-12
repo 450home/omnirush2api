@@ -91,6 +91,7 @@ export class RequestDispatcher {
 
   private handleHealth(res: ServerResponse): void {
     const stats = this.pool.getStats();
+    const isBanned = stats.total > 0 && stats.banned === stats.total;
     const isDegraded = stats.total > 0 && stats.active === 0;
     const isUnhealthy = stats.total === 0;
 
@@ -98,13 +99,14 @@ export class RequestDispatcher {
     res.end(
       JSON.stringify(
         {
-          status: isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
+          status: isBanned ? "banned" : isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
           version: "1.0.0",
           mode: "local-daemon",
           api_key_configured: Boolean(this.config.apiKey),
           account_count: stats.total,
           active_accounts: stats.active,
           cooldown_accounts: stats.inCooldown,
+          banned_accounts: stats.banned,
           supported_models: ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol"],
         },
         null,

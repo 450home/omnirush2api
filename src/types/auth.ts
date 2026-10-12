@@ -61,6 +61,8 @@ export interface AccountState {
   failureCount: number;
   lastUsedAt: number;
   email?: string | undefined;
+  isBanned?: boolean | undefined;
+  bannedReason?: string | undefined;
 }
 
 export interface DiscoveredCredential {

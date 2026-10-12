@@ -68,6 +68,11 @@ However, access to Omnirush quotas is locked behind OAuth device authentication 
 - **Multi-Account Round-Robin**: Pool multiple refresh tokens; requests distribute automatically across accounts.
 - **Intelligent 429 Failover**: Automatically detects rate limits and quota caps (`Retry-After`), parks the exhausted account in cooldown, and retries the request transparently with the next ready account.
 - **Streaming SSE with Reasoning Delta**: Preserves thinking blocks in `delta.reasoning_content` for real-time rendering in coding assistants.
+- **Anti-Ban Wire Guard & Signature Masquerading**:
+  - Emulates official OmniRush Electron desktop client headers (`User-Agent: OmniRush/1.2.4`, `Sec-Ch-Ua`, `Sec-Fetch-*`).
+  - Zero unofficial client signature leaks (strips custom headers; generates realistic device hostnames like `DESKTOP-XXXXXX`).
+  - Per-account concurrency locks prevent overlapping requests from triggering "simultaneous sign-in from another place" detection.
+  - Automated ban detection permanently quarantines closed/suspended accounts from the pool to protect remaining accounts.
 - **Safe & Resource-Bounded**:
   - Client disconnect cancellation via `AbortSignal` (prevents wasted quotas when cancelling prompts).
   - 120-second upstream timeout guards against stalled connections.
@@ -967,6 +972,7 @@ Omnirush2API/
 │   │   ├── model-catalog.ts     # Model list & alias resolver (astra, gpt-6 -> gpt-6-astra)
 │   │   ├── normalizer.ts        # Request normalizer for Omnirush wire API
 │   │   ├── stream-transformer.ts# Real-time SSE transformer with reasoning_content support
+│   │   ├── wire-guard.ts        # Anti-ban wire guard, desktop signature masquerade & ban detector
 │   │   └── completion-handler.ts# Core completion proxy with cancellation & failover retry
 │   ├── server/
 │   │   ├── routes.ts            # Route dispatcher (/v1/models, /v1/chat/completions, /v1/health)
@@ -981,10 +987,10 @@ Omnirush2API/
 │   └── worker/
 │       └── index.ts             # Cloudflare Workers / Vercel Edge fetch entrypoint
 ├── worker/
-│   └── worker.js                # Standalone zero-dependency Cloudflare Worker bundle (24 KB)
+│   └── worker.js                # Standalone zero-dependency Cloudflare Worker bundle (29 KB)
 ├── dist/
-│   └── cli.js                   # Standalone Node.js CLI executable bundle (46 KB)
-├── tests/                       # 36 automated unit & integration tests
+│   └── cli.js                   # Standalone Node.js CLI executable bundle (54 KB)
+├── tests/                       # 42 automated unit & integration tests across 11 suites
 ├── scripts/
 │   └── build.ts                 # esbuild build pipeline
 ├── package.json
@@ -992,6 +998,29 @@ Omnirush2API/
 ```
 
 ## Advanced Guides
+
+### Anti-Ban Wire Guard & Account Protection
+
+Omnirush enforces automated account closure protections triggered by:
+> *"Your OmniRush account was closed automatically because its sign-in was used from another place at the same time or through an unofficial client, which our Terms of Service don't allow."*
+
+Omnirush2API includes built-in wire defenses to protect your accounts:
+
+1. **Official Desktop Client Masquerading**:
+   - Outbound requests emulate the official OmniRush Electron desktop client (`OmniRush/1.2.4`, `Electron/32.2.0`, `Chrome/128.0`).
+   - Includes standard client security headers: `Sec-Ch-Ua`, `Sec-Fetch-Mode: cors`, `Sec-Fetch-Site: cross-site`, and `X-OmniRush-Client: desktop-app`.
+   - Strips all unofficial client headers and identifiers.
+   - Emulates authentic hardware hostnames (`DESKTOP-XXXXXX` / `MacBook-XXXX`) during OAuth device authorization.
+2. **Per-Account Request Serialization (Anti-Concurrency Lock)**:
+   - Enforces a strict per-account mutex lock to prevent concurrent overlapping requests that trigger multi-session fraud detectors.
+3. **Automated Ban Detection & Permanent Quarantine**:
+   - Actively parses upstream responses for account closure notices or suspension warnings.
+   - Upon detection, the affected account is immediately and permanently quarantined (`isBanned: true`) from the pool.
+   - Halts all further retries against the banned account to protect remaining accounts in the pool.
+4. **Token Isolation Recommendation (Crucial for Cloudflare Workers)**:
+   - **Do NOT run the OmniRush Desktop app on your PC at the same time using the exact same refresh token configured in a Cloudflare Worker.**
+   - Cloudflare Workers execute from global datacenter IP addresses (e.g. Frankfurt, Amsterdam, US-West). Firing requests simultaneously from your home IP and Cloudflare datacenter IPs with the same account triggers Omnirush's automated location anomaly detection.
+   - **Best Practice**: Use dedicated accounts for Cloudflare Workers, or close your local desktop app when routing requests through your edge worker.
 
 ### Multi-Account Pooling & 429 Failover
 

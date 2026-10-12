@@ -62,6 +62,87 @@ function getModelList() {
   };
 }
 
+// src/proxy/wire-guard.ts
+var DESKTOP_CLIENT_VERSION = "1.2.4";
+var ELECTRON_VERSION = "32.2.0";
+var CHROME_VERSION = "128.0.6613.186";
+var BAN_PATTERNS = [
+  /closed\s+automatically/i,
+  /unofficial\s+client/i,
+  /used\s+from\s+another\s+place/i,
+  /account\s+was\s+closed/i,
+  /account\s+(?:has\s+been\s+)?suspended/i,
+  /account\s+(?:has\s+been\s+)?banned/i,
+  /terms\s+of\s+service\s+violation/i,
+  /terms\s+of\s+service\s+don't\s+allow/i
+];
+function detectAccountBan(statusCode, bodyText) {
+  if (![400, 401, 403, 451].includes(statusCode)) {
+    return { isBanned: false };
+  }
+  for (const pattern of BAN_PATTERNS) {
+    if (pattern.test(bodyText)) {
+      return {
+        isBanned: true,
+        reason: bodyText.slice(0, 300).trim()
+      };
+    }
+  }
+  return { isBanned: false };
+}
+function detectPlatformSignature() {
+  if (typeof process !== "undefined" && process.platform) {
+    if (process.platform === "darwin") return "darwin";
+    if (process.platform === "linux") return "linux";
+  }
+  return "win32";
+}
+function generateRealisticDeviceName() {
+  const chars = "0123456789ABCDEF";
+  let suffix = "";
+  for (let i = 0; i < 7; i++) {
+    suffix += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  const platform = detectPlatformSignature();
+  if (platform === "darwin") {
+    return `MacBook-${suffix.slice(0, 4)}`;
+  }
+  return `DESKTOP-${suffix}`;
+}
+function createAntiBanHeaders(options) {
+  const platform = options.platform ?? detectPlatformSignature();
+  let osSegment = "Windows NT 10.0; Win64; x64";
+  let secPlatform = '"Windows"';
+  if (platform === "darwin") {
+    osSegment = "Macintosh; Intel Mac OS X 10_15_7";
+    secPlatform = '"macOS"';
+  } else if (platform === "linux") {
+    osSegment = "X11; Linux x86_64";
+    secPlatform = '"Linux"';
+  }
+  const userAgent = `Mozilla/5.0 (${osSegment}) AppleWebKit/537.36 (KHTML, like Gecko) OmniRush/${DESKTOP_CLIENT_VERSION} Chrome/${CHROME_VERSION} Electron/${ELECTRON_VERSION} Safari/537.36`;
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: options.isStream ? "text/event-stream" : "application/json",
+    Authorization: `Bearer ${options.accessToken}`,
+    "User-Agent": userAgent,
+    "X-OmniRush-Client": "desktop-app",
+    "X-OmniRush-Client-Version": DESKTOP_CLIENT_VERSION,
+    "X-OmniRush-Platform": platform,
+    "Sec-Ch-Ua": `"Chromium";v="128", "Not;A=Brand";v="24", "Electron";v="32"`,
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": secPlatform,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
+    "Accept-Language": "en-US,en;q=0.9"
+  };
+  if (options.requestId) {
+    headers["x-omnirush-client-request-id"] = options.requestId;
+  }
+  return headers;
+}
+
 // src/auth/oauth-client.ts
 var DEFAULT_GATEWAY_URL = "https://omnirush.ai/omnirush/v1";
 function getControlPlaneUrl(gatewayUrl = DEFAULT_GATEWAY_URL) {
@@ -81,26 +162,45 @@ function isTokenExpired(expiresAt, bufferSeconds = 300) {
 async function initiateDeviceFlow(options = {}) {
   const {
     gatewayUrl = DEFAULT_GATEWAY_URL,
-    deviceName = "Omnirush2API Tunnel",
-    platform = "node"
+    deviceName = generateRealisticDeviceName(),
+    platform = detectPlatformSignature()
   } = options;
   const controlPlaneUrl = getControlPlaneUrl(gatewayUrl);
-  const response = await fetch(`${controlPlaneUrl}/device/authorize`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json"
-    },
-    body: JSON.stringify({
-      device_name: deviceName,
-      platform
-    })
-  });
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(`Device authorization failed (${response.status}): ${errorText.slice(0, 200)}`);
+  const maxAttempts = 4;
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(`${controlPlaneUrl}/device/authorize`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        body: JSON.stringify({
+          device_name: deviceName,
+          platform
+        })
+      });
+      if (response.ok) {
+        return await response.json();
+      }
+      const errorText = await response.text().catch(() => "");
+      const isRetryable = [500, 502, 503, 504].includes(response.status);
+      lastError = new Error(
+        `Device authorization failed (${response.status}): ${errorText.slice(0, 200)}`
+      );
+      if (!isRetryable || attempt === maxAttempts) {
+        throw lastError;
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt === maxAttempts) {
+        throw lastError;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1e3 * attempt));
   }
-  return await response.json();
+  throw lastError ?? new Error("Device authorization timed out.");
 }
 async function pollDeviceToken(deviceCode, options = {}) {
   const {
@@ -310,12 +410,45 @@ var AccountPoolManager = class {
       email
     });
   }
+  locks = /* @__PURE__ */ new Map();
+  /**
+   * Executes an action under a per-account mutual exclusion lock to prevent concurrent sessions
+   */
+  async withAccountLock(accountId, fn) {
+    while (this.locks.has(accountId)) {
+      await this.locks.get(accountId);
+    }
+    let resolveLock;
+    const lockPromise = new Promise((res) => {
+      resolveLock = res;
+    });
+    this.locks.set(accountId, lockPromise);
+    try {
+      return await fn();
+    } finally {
+      this.locks.delete(accountId);
+      resolveLock();
+    }
+  }
+  /**
+   * Marks an account as permanently banned / suspended, quarantining it from the pool
+   */
+  markBanned(accountId, reason) {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    account.isBanned = true;
+    account.bannedReason = reason ?? "Account suspended/closed by upstream";
+    account.cooldownUntil = Number.MAX_SAFE_INTEGER;
+    console.error(
+      `[Omnirush2API Guard] \u{1F6A8} DANGER: Account ${account.id} was permanently BANNED/SUSPENDED by Omnirush: ${account.bannedReason}. Quarantined from pool.`
+    );
+  }
   /**
    * Marks an account as in cooldown for specified duration
    */
   markCooldown(accountId, durationMs, reason) {
     const account = this.accounts.find((a) => a.id === accountId);
-    if (!account) return;
+    if (!account || account.isBanned) return;
     account.cooldownUntil = Date.now() + durationMs;
     account.failureCount++;
     console.warn(
@@ -332,7 +465,7 @@ var AccountPoolManager = class {
     for (let i = 0; i < total; i++) {
       const idx = (this.currentIndex + i) % total;
       const candidate = this.accounts[idx];
-      if (!candidate) continue;
+      if (!candidate || candidate.isBanned) continue;
       if (now < candidate.cooldownUntil) {
         continue;
       }
@@ -369,8 +502,11 @@ var AccountPoolManager = class {
     const now = Date.now();
     let active = 0;
     let inCooldown = 0;
+    let banned = 0;
     for (const account of this.accounts) {
-      if (now < account.cooldownUntil) {
+      if (account.isBanned) {
+        banned++;
+      } else if (now < account.cooldownUntil) {
         inCooldown++;
       } else {
         active++;
@@ -379,7 +515,8 @@ var AccountPoolManager = class {
     return {
       total: this.accounts.length,
       active,
-      inCooldown
+      inCooldown,
+      banned
     };
   }
   getAllAccounts() {
@@ -651,6 +788,20 @@ var CompletionProxyHandler = class {
       }
       const account = await this.pool.getNextAvailableAccount();
       if (!account) {
+        const stats = this.pool.getStats();
+        if (stats.banned > 0 && stats.active === 0) {
+          return {
+            status: 403,
+            isStream: false,
+            errorResponse: {
+              error: {
+                message: "OmniRush account was closed or suspended by upstream (unofficial client / multi-session detection). Account quarantined.",
+                type: "account_suspended_error",
+                code: "account_banned_by_upstream"
+              }
+            }
+          };
+        }
         return {
           status: 429,
           isStream: false,
@@ -665,33 +816,22 @@ var CompletionProxyHandler = class {
       }
       const requestId = generateRequestId();
       const gatewayUrl = (account.gatewayUrl || this.upstreamBaseUrl).replace(/\/+$/, "");
-      const headers = {
-        "Content-Type": "application/json",
-        Accept: isStream ? "text/event-stream" : "application/json",
-        Authorization: `Bearer ${account.accessToken}`,
-        "X-OmniRush-Client": "omnirush2api/1.0.0",
-        "x-omnirush-client-request-id": requestId
-      };
+      const headers = createAntiBanHeaders({
+        accessToken: account.accessToken ?? "",
+        requestId,
+        isStream
+      });
       const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
       const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
       try {
-        const response = await fetch(`${gatewayUrl}/responses`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(normalizedPayload),
-          signal: combinedSignal
+        const response = await this.pool.withAccountLock(account.id, async () => {
+          return await fetch(`${gatewayUrl}/responses`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(normalizedPayload),
+            signal: combinedSignal
+          });
         });
-        if (response.status === 401) {
-          this.pool.markCooldown(account.id, 6e4, "HTTP 401 Unauthorized");
-          continue;
-        }
-        if (response.status === 429) {
-          const retryAfter = response.headers.get("retry-after");
-          const bodyText = await response.text().catch(() => "");
-          const cooldownMs = parseCooldownDuration(retryAfter, bodyText);
-          this.pool.markCooldown(account.id, cooldownMs, `HTTP 429: ${bodyText.slice(0, 100)}`);
-          continue;
-        }
         if (isStream && response.ok && response.body) {
           const transformedStream = response.body.pipeThrough(
             createSSETransformStream(targetModel)
@@ -703,6 +843,21 @@ var CompletionProxyHandler = class {
           };
         }
         const responseText = await response.text();
+        const banCheck = detectAccountBan(response.status, responseText);
+        if (banCheck.isBanned) {
+          this.pool.markBanned(account.id, banCheck.reason);
+          continue;
+        }
+        if (response.status === 401) {
+          this.pool.markCooldown(account.id, 6e4, "HTTP 401 Unauthorized");
+          continue;
+        }
+        if (response.status === 429) {
+          const retryAfter = response.headers.get("retry-after");
+          const cooldownMs = parseCooldownDuration(retryAfter, responseText);
+          this.pool.markCooldown(account.id, cooldownMs, `HTTP 429: ${responseText.slice(0, 100)}`);
+          continue;
+        }
         let parsedJson = {};
         try {
           parsedJson = JSON.parse(responseText);
@@ -833,19 +988,21 @@ var RequestDispatcher = class {
   }
   handleHealth(res) {
     const stats = this.pool.getStats();
+    const isBanned = stats.total > 0 && stats.banned === stats.total;
     const isDegraded = stats.total > 0 && stats.active === 0;
     const isUnhealthy = stats.total === 0;
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify(
         {
-          status: isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
+          status: isBanned ? "banned" : isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
           version: "1.0.0",
           mode: "local-daemon",
           api_key_configured: Boolean(this.config.apiKey),
           account_count: stats.total,
           active_accounts: stats.active,
           cooldown_accounts: stats.inCooldown,
+          banned_accounts: stats.banned,
           supported_models: ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol"]
         },
         null,

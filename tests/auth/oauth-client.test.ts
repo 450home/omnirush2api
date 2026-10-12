@@ -31,7 +31,8 @@ describe("oauth-client", () => {
         assert.equal(url.toString(), "https://omnirush.ai/omnirush/device/authorize");
         assert.equal(init?.method, "POST");
         const body = JSON.parse(init?.body as string);
-        assert.equal(body.platform, "node");
+        assert.ok(["win32", "darwin", "linux"].includes(body.platform));
+        assert.ok(body.device_name.startsWith("DESKTOP-") || body.device_name.startsWith("MacBook-"));
         return new Response(
           JSON.stringify({
             device_code: "dev_12345",
@@ -49,6 +50,36 @@ describe("oauth-client", () => {
       assert.equal(res.device_code, "dev_12345");
       assert.equal(res.user_code, "USER-CODE-99");
       assert.equal(res.verification_uri_complete, "https://omnirush.ai/device?user_code=USER-CODE-99");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("retries device authorization on intermittent 500 or 502 upstream errors", async () => {
+    const originalFetch = globalThis.fetch;
+    let callCount = 0;
+    try {
+      globalThis.fetch = async () => {
+        callCount++;
+        if (callCount === 1) {
+          return new Response("Internal Server Error", { status: 500 });
+        }
+        return new Response(
+          JSON.stringify({
+            device_code: "dev_retry_ok",
+            user_code: "RETRY-OK",
+            verification_uri: "https://omnirush.ai/device",
+            verification_uri_complete: "https://omnirush.ai/device?code=RETRY-OK",
+            expires_in: 600,
+            interval: 3,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      };
+
+      const res = await initiateDeviceFlow();
+      assert.equal(callCount, 2);
+      assert.equal(res.device_code, "dev_retry_ok");
     } finally {
       globalThis.fetch = originalFetch;
     }
