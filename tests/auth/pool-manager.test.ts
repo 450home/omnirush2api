@@ -105,4 +105,59 @@ describe("pool-manager", () => {
     const acc = await pool.getNextAvailableAccount();
     assert.equal(acc, null);
   });
+
+  it("supports refreshToken|accessToken pair format and skips refresh", async () => {
+    let fetchCalled = false;
+    const origFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => {
+        fetchCalled = true;
+        return new Response("{}", { status: 200 });
+      };
+
+      const pool = new AccountPoolManager();
+      pool.initFromTokenList("ref_123|acc_valid_456");
+
+      const acc = await pool.getNextAvailableAccount();
+      assert.equal(acc?.refreshToken, "ref_123");
+      assert.equal(acc?.accessToken, "acc_valid_456");
+      assert.equal(fetchCalled, false, "Should not call refresh endpoint when valid access token is provided");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("invokes onTokenRotated when refresh token changes", async () => {
+    let rotatedOld = "";
+    let rotatedNew = "";
+
+    const pool = new AccountPoolManager(
+      "https://omnirush.ai/omnirush/v1",
+      async (oldToken, account) => {
+        rotatedOld = oldToken;
+        rotatedNew = account.refreshToken;
+      }
+    );
+    pool.addAccount("old_ref_tok");
+
+    const origFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            access_token: "new_acc_tok",
+            refresh_token: "rotated_new_ref_tok",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      };
+
+      const acc = await pool.getNextAvailableAccount();
+      assert.equal(acc?.refreshToken, "rotated_new_ref_tok");
+      assert.equal(rotatedOld, "old_ref_tok");
+      assert.equal(rotatedNew, "rotated_new_ref_tok");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 });

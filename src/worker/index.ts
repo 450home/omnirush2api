@@ -15,16 +15,48 @@ const CORS_HEADERS: Readonly<Record<string, string>> = {
 let globalPool: AccountPoolManager | null = null;
 let lastTokenHash = "";
 
-function getOrCreatePool(env: WorkerEnv): AccountPoolManager {
-  const tokens = env.OMNIRUSH_REFRESH_TOKEN ?? "";
+async function getOrCreatePool(env: WorkerEnv): Promise<AccountPoolManager> {
+  const envTokens = env.OMNIRUSH_REFRESH_TOKEN ?? "";
+  const accessToken = env.OMNIRUSH_ACCESS_TOKEN ?? "";
   const gatewayUrl = env.GATEWAY_URL || DEFAULT_GATEWAY_URL;
 
-  if (globalPool === null || lastTokenHash !== tokens) {
-    globalPool = new AccountPoolManager(gatewayUrl);
-    if (tokens.trim() !== "") {
-      globalPool.initFromTokenList(tokens);
+  let kvToken: string | null = null;
+  if (env.TOKEN_KV) {
+    try {
+      kvToken = await env.TOKEN_KV.get("omnirush_token");
+    } catch {
+      // Fallback to environment tokens
     }
-    lastTokenHash = tokens;
+  }
+
+  const effectiveTokenString = kvToken || envTokens;
+  const tokenHash = `${effectiveTokenString}::${accessToken}::${gatewayUrl}`;
+
+  if (globalPool === null || lastTokenHash !== tokenHash) {
+    globalPool = new AccountPoolManager(gatewayUrl, async (_oldToken, account) => {
+      if (env.TOKEN_KV) {
+        try {
+          await env.TOKEN_KV.put(
+            "omnirush_token",
+            `${account.refreshToken}|${account.accessToken ?? ""}`
+          );
+        } catch (err) {
+          console.error("[Omnirush2API Worker KV] Failed to store rotated token:", err);
+        }
+      }
+    });
+
+    if (effectiveTokenString.trim() !== "") {
+      globalPool.initFromTokenList(effectiveTokenString);
+      if (accessToken.trim() !== "") {
+        const accounts = globalPool.getAllAccounts();
+        if (accounts.length > 0 && accounts[0] && !accounts[0].accessToken) {
+          (accounts[0] as { accessToken: string | null }).accessToken = accessToken.trim();
+          (accounts[0] as { expiresAt: number }).expiresAt = Date.now() + 3600_000;
+        }
+      }
+    }
+    lastTokenHash = tokenHash;
   }
   return globalPool;
 }
@@ -65,7 +97,7 @@ export default {
       }
     }
 
-    const pool = getOrCreatePool(env);
+    const pool = await getOrCreatePool(env);
 
     // Route: GET /v1/health or /health or /
     if (request.method === "GET" && (pathname === "/v1/health" || pathname === "/health" || pathname === "/")) {
@@ -79,6 +111,7 @@ export default {
         version: "1.0.0",
         mode: "cloudflare-worker",
         api_key_configured: Boolean(env.API_KEY && env.API_KEY.trim() !== ""),
+        kv_storage_configured: Boolean(env.TOKEN_KV),
         account_count: stats.total,
         active_accounts: stats.active,
         cooldown_accounts: stats.inCooldown,

@@ -1,7 +1,7 @@
 import { startHttpServer } from "../../server/http-server.js";
 import { AccountPoolManager } from "../../auth/pool-manager.js";
 import { findLocalCredentials } from "../../auth/clicreds.js";
-import { loadStoredTokens } from "../../auth/token-store.js";
+import { loadStoredTokens, addOrUpdateToken } from "../../auth/token-store.js";
 import { DEFAULT_GATEWAY_URL } from "../../auth/oauth-client.js";
 import type { ServerConfig } from "../../types/config.js";
 
@@ -19,7 +19,22 @@ export async function runStartCommand(options: StartCommandOptions = {}): Promis
   const apiKey = options.key || process.env["API_KEY"];
   const gatewayUrl = options.gatewayUrl || process.env["OMNIRUSH_GATEWAY_URL"] || DEFAULT_GATEWAY_URL;
 
-  const pool = new AccountPoolManager(gatewayUrl);
+  const pool = new AccountPoolManager(gatewayUrl, async (oldToken, account) => {
+    try {
+      await addOrUpdateToken(
+        {
+          refreshToken: account.refreshToken,
+          accessToken: account.accessToken ?? undefined,
+          gatewayUrl: account.gatewayUrl,
+          email: account.email,
+        },
+        oldToken
+      );
+      console.log(`[Omnirush2API RTR] Persisted rotated refresh token to disk (${account.email ?? account.id})`);
+    } catch (err) {
+      console.error(`[Omnirush2API RTR] Failed to persist rotated token:`, err);
+    }
+  });
 
   // 1. If explicit token passed via --token
   if (options.token) {

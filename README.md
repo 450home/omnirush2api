@@ -143,29 +143,33 @@ When running the **Local Daemon**, getting and managing the refresh token is **c
 
 ### 3. For Method 2: Cloudflare Workers (Serverless)
 
-When deploying to **Cloudflare Workers**, you need your raw refresh token to set as an edge secret:
+When deploying to **Cloudflare Workers**, Omnirush enforces single-use **Refresh Token Rotation (RTR)**. To ensure isolates don't invalidate refresh tokens on cold starts, use the token pair format:
 
-1. **Obtain the token**:
-   Run the login script:
+1. **Obtain the token pair**:
+   Run the interactive login script:
    ```bash
    npm run login
    ```
-   Or view all currently stored tokens:
-   ```bash
-   npm run tokens
-   # or: node dist/cli.js tokens list
+   The script outputs **Option A: Cloudflare Worker Secret (Recommended Pair)**:
+   ```text
+   omr_your_refresh_token|omnirush-your_access_token
    ```
-2. **Copy the token**:
-   Copy the `omni_ref_...` token printed in your terminal.
-3. **Add as Worker Secret**:
+
+2. **Add as Worker Secret**:
    In the [Cloudflare Dashboard](https://dash.cloudflare.com):
    - Navigate to **Workers & Pages** -> your `omnirush2api` Worker -> **Settings** -> **Variables and Secrets**.
    - Under **Secrets**, click **Add**.
    - Name: `OMNIRUSH_REFRESH_TOKEN`
-   - Value: Paste your copied refresh token.
-   - Click **Save and deploy**.
+   - Value: Paste the `<refreshToken>|<accessToken>` pair (or raw refresh token).
+   - Click **Deploy**.
 
-> **Pro Tip (Multi-Account Pooling)**: You can paste multiple refresh tokens (one per line) into `OMNIRUSH_REFRESH_TOKEN`. Omnirush2API will automatically round-robin requests across all accounts and failover on 429 rate limits!
+3. **(Recommended) Enable Global KV Sync for Multi-Region Deployments**:
+   To automatically persist and synchronize rotated tokens across worldwide edge isolates:
+   - In Cloudflare Dashboard, go to **Storage & Databases** -> **KV** -> Create a namespace named `OMNIRUSH_TOKENS`.
+   - In your Worker settings under **KV Namespace Bindings**, bind `OMNIRUSH_TOKENS` with variable name: `TOKEN_KV`.
+   - The worker will seamlessly persist and synchronize rotated tokens globally with zero 401s.
+
+> **Pro Tip (Multi-Account Pooling)**: You can paste multiple token pairs (one per line) into `OMNIRUSH_REFRESH_TOKEN`. Omnirush2API will automatically round-robin requests across all accounts and failover on 429 rate limits!
 
 ---
 

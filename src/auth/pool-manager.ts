@@ -1,5 +1,6 @@
 import type { AccountState } from "../types/auth.js";
 import { isTokenExpired, refreshDeviceToken, DEFAULT_GATEWAY_URL } from "./oauth-client.js";
+import { detectAccountBan } from "../proxy/wire-guard.js";
 
 const DEFAULT_COOLDOWN_MS = 3_600_000; // 1 hour
 
@@ -41,6 +42,16 @@ export interface PoolStats {
   readonly banned: number;
 }
 
+export type TokenRotatedCallback = (
+  oldRefreshToken: string,
+  account: AccountState
+) => Promise<void> | void;
+
+export interface AccountPoolOptions {
+  readonly defaultGatewayUrl?: string | undefined;
+  readonly onTokenRotated?: TokenRotatedCallback | undefined;
+}
+
 /**
  * Manages an in-memory pool of accounts with round-robin rotation and cooldown backoff
  */
@@ -48,9 +59,19 @@ export class AccountPoolManager {
   private accounts: AccountState[] = [];
   private currentIndex = 0;
   private defaultGatewayUrl: string;
+  private onTokenRotated?: TokenRotatedCallback | undefined;
 
-  constructor(defaultGatewayUrl: string = DEFAULT_GATEWAY_URL) {
-    this.defaultGatewayUrl = defaultGatewayUrl;
+  constructor(
+    gatewayUrlOrOptions?: string | AccountPoolOptions | undefined,
+    onTokenRotated?: TokenRotatedCallback | undefined
+  ) {
+    if (typeof gatewayUrlOrOptions === "object" && gatewayUrlOrOptions !== null) {
+      this.defaultGatewayUrl = gatewayUrlOrOptions.defaultGatewayUrl || DEFAULT_GATEWAY_URL;
+      this.onTokenRotated = gatewayUrlOrOptions.onTokenRotated;
+    } else {
+      this.defaultGatewayUrl = gatewayUrlOrOptions || DEFAULT_GATEWAY_URL;
+      this.onTokenRotated = onTokenRotated;
+    }
   }
 
   /**
@@ -83,7 +104,13 @@ export class AccountPoolManager {
                       ? rec["gateway_url"]
                       : undefined;
                 const email = typeof rec["email"] === "string" ? rec["email"] : undefined;
-                this.addAccount(ref.trim(), gateway, email);
+                const acc =
+                  typeof rec["accessToken"] === "string"
+                    ? rec["accessToken"]
+                    : typeof rec["access_token"] === "string"
+                      ? rec["access_token"]
+                      : undefined;
+                this.addAccount(ref.trim(), gateway, email, acc?.trim());
               }
             }
           }
@@ -113,18 +140,29 @@ export class AccountPoolManager {
     email?: string,
     initialAccessToken?: string
   ): void {
-    const trimmed = refreshToken.trim();
-    if (trimmed === "" || this.accounts.some((a) => a.refreshToken === trimmed)) {
+    let token = refreshToken.trim();
+    let initialToken = initialAccessToken;
+
+    // Support pair format: "<refreshToken>|<accessToken>"
+    if (token.includes("|")) {
+      const parts = token.split("|");
+      token = (parts[0] ?? "").trim();
+      if (!initialToken && parts[1]) {
+        initialToken = parts[1].trim();
+      }
+    }
+
+    if (token === "" || this.accounts.some((a) => a.refreshToken === token)) {
       return;
     }
 
     const id = `account-${this.accounts.length + 1}`;
     this.accounts.push({
       id,
-      refreshToken: trimmed,
-      accessToken: initialAccessToken ?? null,
+      refreshToken: token,
+      accessToken: initialToken ?? null,
       gatewayUrl: gatewayUrl || this.defaultGatewayUrl,
-      expiresAt: initialAccessToken ? Date.now() + 3600_000 : 0,
+      expiresAt: initialToken ? Date.now() + 3600_000 : 0,
       cooldownUntil: 0,
       failureCount: 0,
       lastUsedAt: 0,
@@ -207,6 +245,7 @@ export class AccountPoolManager {
           gatewayUrl: candidate.gatewayUrl,
         });
 
+        const oldRefreshToken = candidate.refreshToken;
         if (refreshResult.success && refreshResult.accessToken) {
           candidate.accessToken = refreshResult.accessToken;
           if (refreshResult.refreshToken) {
@@ -218,9 +257,25 @@ export class AccountPoolManager {
           const expiresIn = refreshResult.expiresIn ?? 3600;
           candidate.expiresAt = now + expiresIn * 1000;
           candidate.failureCount = 0;
+
+          if (
+            this.onTokenRotated &&
+            refreshResult.refreshToken &&
+            refreshResult.refreshToken !== oldRefreshToken
+          ) {
+            try {
+              await this.onTokenRotated(oldRefreshToken, candidate);
+            } catch (err) {
+              console.error("[Omnirush2API Pool] onTokenRotated callback error:", err);
+            }
+          }
         } else {
-          // Token refresh failed, put account on 60s cooldown and try next candidate
-          this.markCooldown(candidate.id, 60_000, refreshResult.error);
+          const banCheck = detectAccountBan(403, refreshResult.error ?? "");
+          if (banCheck.isBanned) {
+            this.markBanned(candidate.id, banCheck.reason ?? refreshResult.error);
+          } else {
+            this.markCooldown(candidate.id, 60_000, refreshResult.error);
+          }
           continue;
         }
       }
@@ -258,6 +313,14 @@ export class AccountPoolManager {
       inCooldown,
       banned,
     };
+  }
+
+  public invalidateAccountToken(accountId: string): void {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (account) {
+      account.accessToken = null;
+      account.expiresAt = 0;
+    }
   }
 
   public getAllAccounts(): readonly AccountState[] {

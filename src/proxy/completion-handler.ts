@@ -148,7 +148,8 @@ export class CompletionProxyHandler {
 
         // 2. 401 Unauthorized: token might be revoked or expired
         if (response.status === 401) {
-          this.pool.markCooldown(account.id, 60_000, "HTTP 401 Unauthorized");
+          this.pool.invalidateAccountToken(account.id);
+          this.pool.markCooldown(account.id, 10_000, "HTTP 401 Unauthorized");
           continue;
         }
 

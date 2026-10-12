@@ -65,13 +65,33 @@ export async function saveStoredTokens(
 }
 
 /**
- * Adds or updates a token entry in the store
+ * Adds or updates a token entry in the store, optionally replacing an old superseded refresh token
  */
 export async function addOrUpdateToken(
   entry: StoredTokenEntry,
+  oldRefreshTokenOrPath?: string,
   customPath?: string
 ): Promise<void> {
-  const tokens = await loadStoredTokens(customPath);
+  let oldRefreshToken: string | undefined;
+  let targetPath: string | undefined;
+
+  if (customPath !== undefined) {
+    oldRefreshToken = oldRefreshTokenOrPath;
+    targetPath = customPath;
+  } else if (oldRefreshTokenOrPath !== undefined) {
+    if (
+      oldRefreshTokenOrPath.endsWith(".json") ||
+      oldRefreshTokenOrPath.includes(path.sep) ||
+      oldRefreshTokenOrPath.includes("/") ||
+      oldRefreshTokenOrPath.includes("\\")
+    ) {
+      targetPath = oldRefreshTokenOrPath;
+    } else {
+      oldRefreshToken = oldRefreshTokenOrPath;
+    }
+  }
+
+  const tokens = await loadStoredTokens(targetPath);
   const now = Date.now();
   const updatedEntry: StoredTokenEntry = {
     ...entry,
@@ -79,14 +99,18 @@ export async function addOrUpdateToken(
     updatedAt: now,
   };
 
-  const existingIndex = tokens.findIndex((t) => t.refreshToken === entry.refreshToken);
+  const existingIndex = tokens.findIndex(
+    (t) =>
+      t.refreshToken === entry.refreshToken ||
+      (Boolean(oldRefreshToken) && t.refreshToken === oldRefreshToken)
+  );
   if (existingIndex >= 0) {
     tokens[existingIndex] = updatedEntry;
   } else {
     tokens.push(updatedEntry);
   }
 
-  await saveStoredTokens(tokens, customPath);
+  await saveStoredTokens(tokens, targetPath);
 }
 
 /**

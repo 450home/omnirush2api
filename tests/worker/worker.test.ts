@@ -52,4 +52,31 @@ describe("cloudflare worker", () => {
     assert.equal(json["object"], "list");
     assert.ok(Array.isArray(json["data"]));
   });
+
+  it("reads token pair from TOKEN_KV namespace and reports kv_storage_configured", async () => {
+    const store = new Map<string, string>();
+    store.set("omnirush_token", "kv_ref_tok|kv_acc_tok");
+
+    const mockKv = {
+      get: async (key: string) => store.get(key) ?? null,
+      put: async (key: string, value: string) => {
+        store.set(key, value);
+      },
+      delete: async (key: string) => {
+        store.delete(key);
+      },
+    };
+
+    const req = new Request("https://worker.dev/health", { method: "GET" });
+    const env: WorkerEnv = {
+      TOKEN_KV: mockKv,
+    };
+
+    const res = await worker.fetch(req, env);
+    assert.equal(res.status, 200);
+
+    const json = (await res.json()) as Record<string, unknown>;
+    assert.equal(json["kv_storage_configured"], true);
+    assert.equal(json["account_count"], 1);
+  });
 });

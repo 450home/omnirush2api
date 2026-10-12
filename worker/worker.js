@@ -57,9 +57,7 @@ function getModelList() {
 }
 
 // src/proxy/wire-guard.ts
-var DESKTOP_CLIENT_VERSION = "1.2.4";
-var ELECTRON_VERSION = "32.2.0";
-var CHROME_VERSION = "128.0.6613.186";
+var OFFICIAL_VERSION = "2.4.3";
 var BAN_PATTERNS = [
   /closed\s+automatically/i,
   /unofficial\s+client/i,
@@ -92,37 +90,25 @@ function detectPlatformSignature() {
   return "win32";
 }
 function createAntiBanHeaders(options) {
-  const platform = options.platform ?? detectPlatformSignature();
-  let osSegment = "Windows NT 10.0; Win64; x64";
-  let secPlatform = '"Windows"';
-  if (platform === "darwin") {
-    osSegment = "Macintosh; Intel Mac OS X 10_15_7";
-    secPlatform = '"macOS"';
-  } else if (platform === "linux") {
-    osSegment = "X11; Linux x86_64";
-    secPlatform = '"Linux"';
-  }
-  const userAgent = `Mozilla/5.0 (${osSegment}) AppleWebKit/537.36 (KHTML, like Gecko) OmniRush/${DESKTOP_CLIENT_VERSION} Chrome/${CHROME_VERSION} Electron/${ELECTRON_VERSION} Safari/537.36`;
+  const sessionId = options.requestId ?? `sess-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   const headers = {
     "Content-Type": "application/json",
     Accept: options.isStream ? "text/event-stream" : "application/json",
     Authorization: `Bearer ${options.accessToken}`,
-    "User-Agent": userAgent,
-    "X-OmniRush-Client": "desktop-app",
-    "X-OmniRush-Client-Version": DESKTOP_CLIENT_VERSION,
-    "X-OmniRush-Platform": platform,
-    "Sec-Ch-Ua": `"Chromium";v="128", "Not;A=Brand";v="24", "Electron";v="32"`,
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": secPlatform,
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site",
-    "Accept-Language": "en-US,en;q=0.9"
+    "User-Agent": "omnirush",
+    "X-OmniRush-Client": `cli/${OFFICIAL_VERSION}`,
+    "x-omnirush-session-id": sessionId
   };
-  if (options.requestId) {
-    headers["x-omnirush-client-request-id"] = options.requestId;
-  }
   return headers;
+}
+function createAuthApiHeaders() {
+  const platform = detectPlatformSignature();
+  return {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    "User-Agent": `omnirush/${OFFICIAL_VERSION} (${platform}; x64)`,
+    "X-OmniRush-Client": `cli/${OFFICIAL_VERSION}`
+  };
 }
 
 // src/auth/oauth-client.ts
@@ -154,10 +140,7 @@ async function refreshDeviceToken(refreshToken, options = {}) {
     try {
       const response = await fetch(`${controlPlaneUrl}/device/refresh`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json"
-        },
+        headers: createAuthApiHeaders(),
         body: JSON.stringify({ refresh_token: trimmed })
       });
       const responseText = await response.text();
@@ -232,8 +215,15 @@ var AccountPoolManager = class {
   accounts = [];
   currentIndex = 0;
   defaultGatewayUrl;
-  constructor(defaultGatewayUrl = DEFAULT_GATEWAY_URL) {
-    this.defaultGatewayUrl = defaultGatewayUrl;
+  onTokenRotated;
+  constructor(gatewayUrlOrOptions, onTokenRotated) {
+    if (typeof gatewayUrlOrOptions === "object" && gatewayUrlOrOptions !== null) {
+      this.defaultGatewayUrl = gatewayUrlOrOptions.defaultGatewayUrl || DEFAULT_GATEWAY_URL;
+      this.onTokenRotated = gatewayUrlOrOptions.onTokenRotated;
+    } else {
+      this.defaultGatewayUrl = gatewayUrlOrOptions || DEFAULT_GATEWAY_URL;
+      this.onTokenRotated = onTokenRotated;
+    }
   }
   /**
    * Initializes the pool from a delimiter-separated token string (newlines, commas) or JSON array
@@ -254,7 +244,8 @@ var AccountPoolManager = class {
               if (ref && ref.trim()) {
                 const gateway = typeof rec["gatewayUrl"] === "string" ? rec["gatewayUrl"] : typeof rec["gateway_url"] === "string" ? rec["gateway_url"] : void 0;
                 const email = typeof rec["email"] === "string" ? rec["email"] : void 0;
-                this.addAccount(ref.trim(), gateway, email);
+                const acc = typeof rec["accessToken"] === "string" ? rec["accessToken"] : typeof rec["access_token"] === "string" ? rec["access_token"] : void 0;
+                this.addAccount(ref.trim(), gateway, email, acc?.trim());
               }
             }
           }
@@ -272,17 +263,25 @@ var AccountPoolManager = class {
    * Adds an account to the pool
    */
   addAccount(refreshToken, gatewayUrl, email, initialAccessToken) {
-    const trimmed = refreshToken.trim();
-    if (trimmed === "" || this.accounts.some((a) => a.refreshToken === trimmed)) {
+    let token = refreshToken.trim();
+    let initialToken = initialAccessToken;
+    if (token.includes("|")) {
+      const parts = token.split("|");
+      token = (parts[0] ?? "").trim();
+      if (!initialToken && parts[1]) {
+        initialToken = parts[1].trim();
+      }
+    }
+    if (token === "" || this.accounts.some((a) => a.refreshToken === token)) {
       return;
     }
     const id = `account-${this.accounts.length + 1}`;
     this.accounts.push({
       id,
-      refreshToken: trimmed,
-      accessToken: initialAccessToken ?? null,
+      refreshToken: token,
+      accessToken: initialToken ?? null,
       gatewayUrl: gatewayUrl || this.defaultGatewayUrl,
-      expiresAt: initialAccessToken ? Date.now() + 36e5 : 0,
+      expiresAt: initialToken ? Date.now() + 36e5 : 0,
       cooldownUntil: 0,
       failureCount: 0,
       lastUsedAt: 0,
@@ -352,6 +351,7 @@ var AccountPoolManager = class {
         const refreshResult = await refreshDeviceToken(candidate.refreshToken, {
           gatewayUrl: candidate.gatewayUrl
         });
+        const oldRefreshToken = candidate.refreshToken;
         if (refreshResult.success && refreshResult.accessToken) {
           candidate.accessToken = refreshResult.accessToken;
           if (refreshResult.refreshToken) {
@@ -363,8 +363,20 @@ var AccountPoolManager = class {
           const expiresIn = refreshResult.expiresIn ?? 3600;
           candidate.expiresAt = now + expiresIn * 1e3;
           candidate.failureCount = 0;
+          if (this.onTokenRotated && refreshResult.refreshToken && refreshResult.refreshToken !== oldRefreshToken) {
+            try {
+              await this.onTokenRotated(oldRefreshToken, candidate);
+            } catch (err) {
+              console.error("[Omnirush2API Pool] onTokenRotated callback error:", err);
+            }
+          }
         } else {
-          this.markCooldown(candidate.id, 6e4, refreshResult.error);
+          const banCheck = detectAccountBan(403, refreshResult.error ?? "");
+          if (banCheck.isBanned) {
+            this.markBanned(candidate.id, banCheck.reason ?? refreshResult.error);
+          } else {
+            this.markCooldown(candidate.id, 6e4, refreshResult.error);
+          }
           continue;
         }
       }
@@ -397,6 +409,13 @@ var AccountPoolManager = class {
       inCooldown,
       banned
     };
+  }
+  invalidateAccountToken(accountId) {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (account) {
+      account.accessToken = null;
+      account.expiresAt = 0;
+    }
   }
   getAllAccounts() {
     return this.accounts;
@@ -728,7 +747,8 @@ var CompletionProxyHandler = class {
           continue;
         }
         if (response.status === 401) {
-          this.pool.markCooldown(account.id, 6e4, "HTTP 401 Unauthorized");
+          this.pool.invalidateAccountToken(account.id);
+          this.pool.markCooldown(account.id, 1e4, "HTTP 401 Unauthorized");
           continue;
         }
         if (response.status === 429) {
@@ -804,15 +824,43 @@ var CORS_HEADERS = {
 };
 var globalPool = null;
 var lastTokenHash = "";
-function getOrCreatePool(env) {
-  const tokens = env.OMNIRUSH_REFRESH_TOKEN ?? "";
+async function getOrCreatePool(env) {
+  const envTokens = env.OMNIRUSH_REFRESH_TOKEN ?? "";
+  const accessToken = env.OMNIRUSH_ACCESS_TOKEN ?? "";
   const gatewayUrl = env.GATEWAY_URL || DEFAULT_GATEWAY_URL;
-  if (globalPool === null || lastTokenHash !== tokens) {
-    globalPool = new AccountPoolManager(gatewayUrl);
-    if (tokens.trim() !== "") {
-      globalPool.initFromTokenList(tokens);
+  let kvToken = null;
+  if (env.TOKEN_KV) {
+    try {
+      kvToken = await env.TOKEN_KV.get("omnirush_token");
+    } catch {
     }
-    lastTokenHash = tokens;
+  }
+  const effectiveTokenString = kvToken || envTokens;
+  const tokenHash = `${effectiveTokenString}::${accessToken}::${gatewayUrl}`;
+  if (globalPool === null || lastTokenHash !== tokenHash) {
+    globalPool = new AccountPoolManager(gatewayUrl, async (_oldToken, account) => {
+      if (env.TOKEN_KV) {
+        try {
+          await env.TOKEN_KV.put(
+            "omnirush_token",
+            `${account.refreshToken}|${account.accessToken ?? ""}`
+          );
+        } catch (err) {
+          console.error("[Omnirush2API Worker KV] Failed to store rotated token:", err);
+        }
+      }
+    });
+    if (effectiveTokenString.trim() !== "") {
+      globalPool.initFromTokenList(effectiveTokenString);
+      if (accessToken.trim() !== "") {
+        const accounts = globalPool.getAllAccounts();
+        if (accounts.length > 0 && accounts[0] && !accounts[0].accessToken) {
+          accounts[0].accessToken = accessToken.trim();
+          accounts[0].expiresAt = Date.now() + 36e5;
+        }
+      }
+    }
+    lastTokenHash = tokenHash;
   }
   return globalPool;
 }
@@ -847,7 +895,7 @@ var index_default = {
         );
       }
     }
-    const pool = getOrCreatePool(env);
+    const pool = await getOrCreatePool(env);
     if (request.method === "GET" && (pathname === "/v1/health" || pathname === "/health" || pathname === "/")) {
       const stats = pool.getStats();
       const isBanned = stats.total > 0 && stats.banned === stats.total;
@@ -858,6 +906,7 @@ var index_default = {
         version: "1.0.0",
         mode: "cloudflare-worker",
         api_key_configured: Boolean(env.API_KEY && env.API_KEY.trim() !== ""),
+        kv_storage_configured: Boolean(env.TOKEN_KV),
         account_count: stats.total,
         active_accounts: stats.active,
         cooldown_accounts: stats.inCooldown,

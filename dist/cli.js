@@ -63,9 +63,7 @@ function getModelList() {
 }
 
 // src/proxy/wire-guard.ts
-var DESKTOP_CLIENT_VERSION = "1.2.4";
-var ELECTRON_VERSION = "32.2.0";
-var CHROME_VERSION = "128.0.6613.186";
+var OFFICIAL_VERSION = "2.4.3";
 var BAN_PATTERNS = [
   /closed\s+automatically/i,
   /unofficial\s+client/i,
@@ -110,37 +108,25 @@ function generateRealisticDeviceName() {
   return `DESKTOP-${suffix}`;
 }
 function createAntiBanHeaders(options) {
-  const platform = options.platform ?? detectPlatformSignature();
-  let osSegment = "Windows NT 10.0; Win64; x64";
-  let secPlatform = '"Windows"';
-  if (platform === "darwin") {
-    osSegment = "Macintosh; Intel Mac OS X 10_15_7";
-    secPlatform = '"macOS"';
-  } else if (platform === "linux") {
-    osSegment = "X11; Linux x86_64";
-    secPlatform = '"Linux"';
-  }
-  const userAgent = `Mozilla/5.0 (${osSegment}) AppleWebKit/537.36 (KHTML, like Gecko) OmniRush/${DESKTOP_CLIENT_VERSION} Chrome/${CHROME_VERSION} Electron/${ELECTRON_VERSION} Safari/537.36`;
+  const sessionId = options.requestId ?? `sess-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   const headers = {
     "Content-Type": "application/json",
     Accept: options.isStream ? "text/event-stream" : "application/json",
     Authorization: `Bearer ${options.accessToken}`,
-    "User-Agent": userAgent,
-    "X-OmniRush-Client": "desktop-app",
-    "X-OmniRush-Client-Version": DESKTOP_CLIENT_VERSION,
-    "X-OmniRush-Platform": platform,
-    "Sec-Ch-Ua": `"Chromium";v="128", "Not;A=Brand";v="24", "Electron";v="32"`,
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": secPlatform,
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site",
-    "Accept-Language": "en-US,en;q=0.9"
+    "User-Agent": "omnirush",
+    "X-OmniRush-Client": `cli/${OFFICIAL_VERSION}`,
+    "x-omnirush-session-id": sessionId
   };
-  if (options.requestId) {
-    headers["x-omnirush-client-request-id"] = options.requestId;
-  }
   return headers;
+}
+function createAuthApiHeaders() {
+  const platform = detectPlatformSignature();
+  return {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    "User-Agent": `omnirush/${OFFICIAL_VERSION} (${platform}; x64)`,
+    "X-OmniRush-Client": `cli/${OFFICIAL_VERSION}`
+  };
 }
 
 // src/auth/oauth-client.ts
@@ -172,10 +158,7 @@ async function initiateDeviceFlow(options = {}) {
     try {
       const response = await fetch(`${controlPlaneUrl}/device/authorize`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json"
-        },
+        headers: createAuthApiHeaders(),
         body: JSON.stringify({
           device_name: deviceName,
           platform
@@ -219,10 +202,7 @@ async function pollDeviceToken(deviceCode, options = {}) {
     try {
       const response = await fetch(`${controlPlaneUrl}/device/token`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json"
-        },
+        headers: createAuthApiHeaders(),
         body: JSON.stringify({ device_code: deviceCode }),
         ...signal ? { signal } : {}
       });
@@ -270,10 +250,7 @@ async function refreshDeviceToken(refreshToken, options = {}) {
     try {
       const response = await fetch(`${controlPlaneUrl}/device/refresh`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json"
-        },
+        headers: createAuthApiHeaders(),
         body: JSON.stringify({ refresh_token: trimmed })
       });
       const responseText = await response.text();
@@ -326,8 +303,8 @@ async function fetchAccountProfile(accessToken, gatewayUrl = DEFAULT_GATEWAY_URL
     const response = await fetch(`${controlPlaneUrl}/device/me`, {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${accessToken.trim()}`,
-        Accept: "application/json"
+        ...createAuthApiHeaders(),
+        Authorization: `Bearer ${accessToken.trim()}`
       }
     });
     if (!response.ok) {
@@ -366,8 +343,15 @@ var AccountPoolManager = class {
   accounts = [];
   currentIndex = 0;
   defaultGatewayUrl;
-  constructor(defaultGatewayUrl = DEFAULT_GATEWAY_URL) {
-    this.defaultGatewayUrl = defaultGatewayUrl;
+  onTokenRotated;
+  constructor(gatewayUrlOrOptions, onTokenRotated) {
+    if (typeof gatewayUrlOrOptions === "object" && gatewayUrlOrOptions !== null) {
+      this.defaultGatewayUrl = gatewayUrlOrOptions.defaultGatewayUrl || DEFAULT_GATEWAY_URL;
+      this.onTokenRotated = gatewayUrlOrOptions.onTokenRotated;
+    } else {
+      this.defaultGatewayUrl = gatewayUrlOrOptions || DEFAULT_GATEWAY_URL;
+      this.onTokenRotated = onTokenRotated;
+    }
   }
   /**
    * Initializes the pool from a delimiter-separated token string (newlines, commas) or JSON array
@@ -388,7 +372,8 @@ var AccountPoolManager = class {
               if (ref && ref.trim()) {
                 const gateway = typeof rec["gatewayUrl"] === "string" ? rec["gatewayUrl"] : typeof rec["gateway_url"] === "string" ? rec["gateway_url"] : void 0;
                 const email = typeof rec["email"] === "string" ? rec["email"] : void 0;
-                this.addAccount(ref.trim(), gateway, email);
+                const acc = typeof rec["accessToken"] === "string" ? rec["accessToken"] : typeof rec["access_token"] === "string" ? rec["access_token"] : void 0;
+                this.addAccount(ref.trim(), gateway, email, acc?.trim());
               }
             }
           }
@@ -406,17 +391,25 @@ var AccountPoolManager = class {
    * Adds an account to the pool
    */
   addAccount(refreshToken, gatewayUrl, email, initialAccessToken) {
-    const trimmed = refreshToken.trim();
-    if (trimmed === "" || this.accounts.some((a) => a.refreshToken === trimmed)) {
+    let token = refreshToken.trim();
+    let initialToken = initialAccessToken;
+    if (token.includes("|")) {
+      const parts = token.split("|");
+      token = (parts[0] ?? "").trim();
+      if (!initialToken && parts[1]) {
+        initialToken = parts[1].trim();
+      }
+    }
+    if (token === "" || this.accounts.some((a) => a.refreshToken === token)) {
       return;
     }
     const id = `account-${this.accounts.length + 1}`;
     this.accounts.push({
       id,
-      refreshToken: trimmed,
-      accessToken: initialAccessToken ?? null,
+      refreshToken: token,
+      accessToken: initialToken ?? null,
       gatewayUrl: gatewayUrl || this.defaultGatewayUrl,
-      expiresAt: initialAccessToken ? Date.now() + 36e5 : 0,
+      expiresAt: initialToken ? Date.now() + 36e5 : 0,
       cooldownUntil: 0,
       failureCount: 0,
       lastUsedAt: 0,
@@ -486,6 +479,7 @@ var AccountPoolManager = class {
         const refreshResult = await refreshDeviceToken(candidate.refreshToken, {
           gatewayUrl: candidate.gatewayUrl
         });
+        const oldRefreshToken = candidate.refreshToken;
         if (refreshResult.success && refreshResult.accessToken) {
           candidate.accessToken = refreshResult.accessToken;
           if (refreshResult.refreshToken) {
@@ -497,8 +491,20 @@ var AccountPoolManager = class {
           const expiresIn = refreshResult.expiresIn ?? 3600;
           candidate.expiresAt = now + expiresIn * 1e3;
           candidate.failureCount = 0;
+          if (this.onTokenRotated && refreshResult.refreshToken && refreshResult.refreshToken !== oldRefreshToken) {
+            try {
+              await this.onTokenRotated(oldRefreshToken, candidate);
+            } catch (err) {
+              console.error("[Omnirush2API Pool] onTokenRotated callback error:", err);
+            }
+          }
         } else {
-          this.markCooldown(candidate.id, 6e4, refreshResult.error);
+          const banCheck = detectAccountBan(403, refreshResult.error ?? "");
+          if (banCheck.isBanned) {
+            this.markBanned(candidate.id, banCheck.reason ?? refreshResult.error);
+          } else {
+            this.markCooldown(candidate.id, 6e4, refreshResult.error);
+          }
           continue;
         }
       }
@@ -531,6 +537,13 @@ var AccountPoolManager = class {
       inCooldown,
       banned
     };
+  }
+  invalidateAccountToken(accountId) {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (account) {
+      account.accessToken = null;
+      account.expiresAt = 0;
+    }
   }
   getAllAccounts() {
     return this.accounts;
@@ -862,7 +875,8 @@ var CompletionProxyHandler = class {
           continue;
         }
         if (response.status === 401) {
-          this.pool.markCooldown(account.id, 6e4, "HTTP 401 Unauthorized");
+          this.pool.invalidateAccountToken(account.id);
+          this.pool.markCooldown(account.id, 1e4, "HTTP 401 Unauthorized");
           continue;
         }
         if (response.status === 429) {
@@ -1307,21 +1321,35 @@ async function saveStoredTokens(tokens, customPath) {
   await fs2.writeFile(tempPath, content, { encoding: "utf8", mode: 384 });
   await fs2.rename(tempPath, targetPath);
 }
-async function addOrUpdateToken(entry, customPath) {
-  const tokens = await loadStoredTokens(customPath);
+async function addOrUpdateToken(entry, oldRefreshTokenOrPath, customPath) {
+  let oldRefreshToken;
+  let targetPath;
+  if (customPath !== void 0) {
+    oldRefreshToken = oldRefreshTokenOrPath;
+    targetPath = customPath;
+  } else if (oldRefreshTokenOrPath !== void 0) {
+    if (oldRefreshTokenOrPath.endsWith(".json") || oldRefreshTokenOrPath.includes(path2.sep) || oldRefreshTokenOrPath.includes("/") || oldRefreshTokenOrPath.includes("\\")) {
+      targetPath = oldRefreshTokenOrPath;
+    } else {
+      oldRefreshToken = oldRefreshTokenOrPath;
+    }
+  }
+  const tokens = await loadStoredTokens(targetPath);
   const now = Date.now();
   const updatedEntry = {
     ...entry,
     gatewayUrl: entry.gatewayUrl || DEFAULT_GATEWAY_URL,
     updatedAt: now
   };
-  const existingIndex = tokens.findIndex((t) => t.refreshToken === entry.refreshToken);
+  const existingIndex = tokens.findIndex(
+    (t) => t.refreshToken === entry.refreshToken || Boolean(oldRefreshToken) && t.refreshToken === oldRefreshToken
+  );
   if (existingIndex >= 0) {
     tokens[existingIndex] = updatedEntry;
   } else {
     tokens.push(updatedEntry);
   }
-  await saveStoredTokens(tokens, customPath);
+  await saveStoredTokens(tokens, targetPath);
 }
 async function removeToken(refreshToken, customPath) {
   const tokens = await loadStoredTokens(customPath);
@@ -1339,7 +1367,22 @@ async function runStartCommand(options = {}) {
   const host = options.host ?? "127.0.0.1";
   const apiKey = options.key || process.env["API_KEY"];
   const gatewayUrl = options.gatewayUrl || process.env["OMNIRUSH_GATEWAY_URL"] || DEFAULT_GATEWAY_URL;
-  const pool = new AccountPoolManager(gatewayUrl);
+  const pool = new AccountPoolManager(gatewayUrl, async (oldToken, account) => {
+    try {
+      await addOrUpdateToken(
+        {
+          refreshToken: account.refreshToken,
+          accessToken: account.accessToken ?? void 0,
+          gatewayUrl: account.gatewayUrl,
+          email: account.email
+        },
+        oldToken
+      );
+      console.log(`[Omnirush2API RTR] Persisted rotated refresh token to disk (${account.email ?? account.id})`);
+    } catch (err) {
+      console.error(`[Omnirush2API RTR] Failed to persist rotated token:`, err);
+    }
+  });
   if (options.token) {
     pool.initFromTokenList(options.token);
   }
@@ -1448,16 +1491,24 @@ async function runLoginCommand(options = {}) {
     console.log("================================================================================");
     console.log("\u{1F389} Omnirush OAuth Login Successful!");
     console.log("================================================================================");
-    console.log("\nYour Refresh Token (Copy this for Cloudflare Worker secret OMNIRUSH_REFRESH_TOKEN):");
+    console.log("\n[Option A: Cloudflare Worker Secret (Recommended Pair)]");
+    console.log("Set OMNIRUSH_REFRESH_TOKEN to this pair to avoid cold start refresh invalidation:");
     console.log("--------------------------------------------------------------------------------");
-    console.log(tokenResult.refreshToken);
+    console.log(`${tokenResult.refreshToken}|${tokenResult.accessToken ?? ""}`);
     console.log("--------------------------------------------------------------------------------\n");
+    console.log("[Option B: Separate Secrets / Local Daemon]");
+    console.log(`\u2022 Refresh Token:  ${tokenResult.refreshToken}`);
+    if (tokenResult.accessToken) {
+      console.log(`\u2022 Access Token:   ${tokenResult.accessToken}`);
+    }
+    console.log("");
     if (email) console.log(`\u2713 Account:          ${email} (${plan})`);
     if (remainingTokens !== void 0) console.log(`\u2713 Tokens Remaining: ${remainingTokens.toLocaleString()}`);
     console.log("\u2713 Saved to Disk:    ~/.omnirush2api/tokens.json");
     console.log("\nNext Steps:");
-    console.log("  \u2022 For Local Daemon:       node dist/cli.js start");
-    console.log("  \u2022 For Cloudflare Workers: Paste the token into your Worker's OMNIRUSH_REFRESH_TOKEN secret\n");
+    console.log("  \u2022 Local Daemon:       npm start  (auto-persists rotated tokens to disk)");
+    console.log("  \u2022 Cloudflare Worker:  Paste Option A into OMNIRUSH_REFRESH_TOKEN secret");
+    console.log("  \u2022 Worker KV Sync:     (Optional) Bind a KV namespace as TOKEN_KV for multi-region sync\n");
   } catch (err) {
     console.error(`
 \u274C Error during login: ${err instanceof Error ? err.message : String(err)}`);

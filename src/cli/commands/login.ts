@@ -86,16 +86,24 @@ export async function runLoginCommand(options: LoginCommandOptions = {}): Promis
     console.log("================================================================================");
     console.log("🎉 Omnirush OAuth Login Successful!");
     console.log("================================================================================");
-    console.log("\nYour Refresh Token (Copy this for Cloudflare Worker secret OMNIRUSH_REFRESH_TOKEN):");
+    console.log("\n[Option A: Cloudflare Worker Secret (Recommended Pair)]");
+    console.log("Set OMNIRUSH_REFRESH_TOKEN to this pair to avoid cold start refresh invalidation:");
     console.log("--------------------------------------------------------------------------------");
-    console.log(tokenResult.refreshToken);
+    console.log(`${tokenResult.refreshToken}|${tokenResult.accessToken ?? ""}`);
     console.log("--------------------------------------------------------------------------------\n");
+    console.log("[Option B: Separate Secrets / Local Daemon]");
+    console.log(`• Refresh Token:  ${tokenResult.refreshToken}`);
+    if (tokenResult.accessToken) {
+      console.log(`• Access Token:   ${tokenResult.accessToken}`);
+    }
+    console.log("");
     if (email) console.log(`✓ Account:          ${email} (${plan})`);
     if (remainingTokens !== undefined) console.log(`✓ Tokens Remaining: ${remainingTokens.toLocaleString()}`);
     console.log("✓ Saved to Disk:    ~/.omnirush2api/tokens.json");
     console.log("\nNext Steps:");
-    console.log("  • For Local Daemon:       node dist/cli.js start");
-    console.log("  • For Cloudflare Workers: Paste the token into your Worker's OMNIRUSH_REFRESH_TOKEN secret\n");
+    console.log("  • Local Daemon:       npm start  (auto-persists rotated tokens to disk)");
+    console.log("  • Cloudflare Worker:  Paste Option A into OMNIRUSH_REFRESH_TOKEN secret");
+    console.log("  • Worker KV Sync:     (Optional) Bind a KV namespace as TOKEN_KV for multi-region sync\n");
   } catch (err) {
     console.error(`\n❌ Error during login: ${err instanceof Error ? err.message : String(err)}`);
     process.exitCode = 1;

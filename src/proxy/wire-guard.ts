@@ -1,7 +1,7 @@
 /**
- * Anti-Ban & Desktop Client Wire Guard
- * Emulates official OmniRush desktop client signatures, masks unofficial runtimes,
- * and detects upstream account suspension/ban notices.
+ * Anti-Ban & Official Client Wire Guard
+ * Replicates official Omnirush CLI & Desktop wire signatures (from omnirush@2.4.3),
+ * handles one-time Refresh Token Rotation (RTR), and detects account suspension notices.
  */
 
 export interface AntiBanHeaderOptions {
@@ -16,9 +16,7 @@ export interface AccountBanCheckResult {
   readonly reason?: string | undefined;
 }
 
-const DESKTOP_CLIENT_VERSION = "1.2.4";
-const ELECTRON_VERSION = "32.2.0";
-const CHROME_VERSION = "128.0.6613.186";
+export const OFFICIAL_VERSION = "2.4.3";
 
 const BAN_PATTERNS: readonly RegExp[] = [
   /closed\s+automatically/i,
@@ -56,7 +54,7 @@ export function detectAccountBan(
 }
 
 /**
- * Returns platform signature string matching OmniRush desktop Electron conventions
+ * Returns platform signature string matching OmniRush conventions
  */
 export function detectPlatformSignature(): "win32" | "darwin" | "linux" {
   if (typeof process !== "undefined" && process.platform) {
@@ -83,46 +81,41 @@ export function generateRealisticDeviceName(): string {
 }
 
 /**
- * Constructs official OmniRush desktop headers to avoid unofficial client detection
+ * Constructs official headers for model requests (/responses, /chat/completions)
+ * Matches official token-proxy.js lines 278-295:
+ * - User-Agent: "omnirush" (bare product name, versioned "omnirush/x" is refused as lookalike)
+ * - X-OmniRush-Client: "cli/2.4.3"
+ * - x-omnirush-session-id: <uuid>
  */
 export function createAntiBanHeaders(
   options: AntiBanHeaderOptions
 ): Record<string, string> {
-  const platform = options.platform ?? detectPlatformSignature();
-
-  let osSegment = "Windows NT 10.0; Win64; x64";
-  let secPlatform = '"Windows"';
-
-  if (platform === "darwin") {
-    osSegment = "Macintosh; Intel Mac OS X 10_15_7";
-    secPlatform = '"macOS"';
-  } else if (platform === "linux") {
-    osSegment = "X11; Linux x86_64";
-    secPlatform = '"Linux"';
-  }
-
-  const userAgent = `Mozilla/5.0 (${osSegment}) AppleWebKit/537.36 (KHTML, like Gecko) OmniRush/${DESKTOP_CLIENT_VERSION} Chrome/${CHROME_VERSION} Electron/${ELECTRON_VERSION} Safari/537.36`;
+  const sessionId = options.requestId ?? `sess-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: options.isStream ? "text/event-stream" : "application/json",
     Authorization: `Bearer ${options.accessToken}`,
-    "User-Agent": userAgent,
-    "X-OmniRush-Client": "desktop-app",
-    "X-OmniRush-Client-Version": DESKTOP_CLIENT_VERSION,
-    "X-OmniRush-Platform": platform,
-    "Sec-Ch-Ua": `"Chromium";v="128", "Not;A=Brand";v="24", "Electron";v="32"`,
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": secPlatform,
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site",
-    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "omnirush",
+    "X-OmniRush-Client": `cli/${OFFICIAL_VERSION}`,
+    "x-omnirush-session-id": sessionId,
   };
 
-  if (options.requestId) {
-    headers["x-omnirush-client-request-id"] = options.requestId;
-  }
-
   return headers;
+}
+
+/**
+ * Constructs official headers for device authentication endpoints (/device/*)
+ * Matches official auth.js lines 68-94:
+ * - User-Agent: "omnirush/<version> (<platform>; <arch>)"
+ * - X-OmniRush-Client: "cli/<version>"
+ */
+export function createAuthApiHeaders(): Record<string, string> {
+  const platform = detectPlatformSignature();
+  return {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    "User-Agent": `omnirush/${OFFICIAL_VERSION} (${platform}; x64)`,
+    "X-OmniRush-Client": `cli/${OFFICIAL_VERSION}`,
+  };
 }

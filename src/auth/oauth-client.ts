@@ -7,6 +7,7 @@ import type {
 import {
   generateRealisticDeviceName,
   detectPlatformSignature,
+  createAuthApiHeaders,
 } from "../proxy/wire-guard.js";
 
 export const DEFAULT_GATEWAY_URL = "https://omnirush.ai/omnirush/v1";
@@ -59,10 +60,7 @@ export async function initiateDeviceFlow(
     try {
       const response = await fetch(`${controlPlaneUrl}/device/authorize`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
+        headers: createAuthApiHeaders(),
         body: JSON.stringify({
           device_name: deviceName,
           platform,
@@ -128,10 +126,7 @@ export async function pollDeviceToken(
     try {
       const response = await fetch(`${controlPlaneUrl}/device/token`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
+        headers: createAuthApiHeaders(),
         body: JSON.stringify({ device_code: deviceCode }),
         ...(signal ? { signal } : {}),
       });
@@ -197,10 +192,7 @@ export async function refreshDeviceToken(
     try {
       const response = await fetch(`${controlPlaneUrl}/device/refresh`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
+        headers: createAuthApiHeaders(),
         body: JSON.stringify({ refresh_token: trimmed }),
       });
 
@@ -272,8 +264,8 @@ export async function fetchAccountProfile(
     const response = await fetch(`${controlPlaneUrl}/device/me`, {
       method: "GET",
       headers: {
+        ...createAuthApiHeaders(),
         Authorization: `Bearer ${accessToken.trim()}`,
-        Accept: "application/json",
       },
     });
 

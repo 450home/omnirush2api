@@ -11,10 +11,18 @@ export interface ServerConfig {
   readonly timeoutMs?: number | undefined;
 }
 
+export interface WorkerKVNamespace {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
 export interface WorkerEnv {
   readonly OMNIRUSH_REFRESH_TOKEN?: string | undefined;
+  readonly OMNIRUSH_ACCESS_TOKEN?: string | undefined;
   readonly API_KEY?: string | undefined;
   readonly GATEWAY_URL?: string | undefined;
+  readonly TOKEN_KV?: WorkerKVNamespace | undefined;
 }
 
 export interface HealthStatusResponse {

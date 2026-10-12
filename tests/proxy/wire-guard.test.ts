@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   detectAccountBan,
   createAntiBanHeaders,
+  createAuthApiHeaders,
   generateRealisticDeviceName,
   detectPlatformSignature,
 } from "../../src/proxy/wire-guard.js";
@@ -28,10 +29,10 @@ describe("anti-ban wire guard & ban protection", () => {
     assert.equal(res4.isBanned, false);
   });
 
-  it("generates anti-ban desktop headers with zero unofficial client leaks", () => {
+  it("generates anti-ban official client headers with zero unofficial client leaks", () => {
     const headers = createAntiBanHeaders({
       accessToken: "mock_acc_token",
-      requestId: "req-123",
+      requestId: "sess-123",
       isStream: true,
     });
 
@@ -41,15 +42,17 @@ describe("anti-ban wire guard & ban protection", () => {
       assert.ok(!val.toLowerCase().includes("omnirush2api"), `Header value leaked unofficial name: ${val}`);
     }
 
-    // Required desktop masquerade signatures
-    assert.ok(headers["User-Agent"]);
-    assert.ok(headers["User-Agent"].includes("OmniRush/"));
-    assert.ok(headers["User-Agent"].includes("Electron/"));
-    assert.equal(headers["X-OmniRush-Client"], "desktop-app");
-    assert.ok(headers["Sec-Ch-Ua"]);
-    assert.ok(headers["Accept-Language"]);
+    // Required official client signatures (matching omnirush@2.4.3 token-proxy.js)
+    assert.equal(headers["User-Agent"], "omnirush");
+    assert.equal(headers["X-OmniRush-Client"], "cli/2.4.3");
+    assert.equal(headers["x-omnirush-session-id"], "sess-123");
     assert.equal(headers["Authorization"], "Bearer mock_acc_token");
     assert.equal(headers["Accept"], "text/event-stream");
+
+    // Test official auth API headers
+    const authHeaders = createAuthApiHeaders();
+    assert.ok(authHeaders["User-Agent"]?.startsWith("omnirush/2.4.3 ("));
+    assert.equal(authHeaders["X-OmniRush-Client"], "cli/2.4.3");
   });
 
   it("generates realistic device names and platform signatures", () => {
