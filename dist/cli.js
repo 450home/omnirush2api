@@ -1023,7 +1023,7 @@ var RequestDispatcher = class {
       JSON.stringify(
         {
           status: isBanned ? "banned" : isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
-          version: "1.0.0",
+          version: "1.0.1",
           mode: "local-daemon",
           api_key_configured: Boolean(this.config.apiKey),
           account_count: stats.total,
@@ -1634,7 +1634,7 @@ Stored Tokens in ~/.omnirush2api/tokens.json (${tokens.length}):
 }
 
 // src/cli/index.ts
-var VERSION = "1.0.0";
+var VERSION = "1.0.1";
 function printHelp() {
   console.log(`
 Omnirush2API v${VERSION}

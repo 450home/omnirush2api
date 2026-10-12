@@ -4,7 +4,7 @@ import { runCheckCommand } from "./commands/check.js";
 import { runTokensCommand } from "./commands/tokens.js";
 import type { CliOptions } from "../types/config.js";
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 
 function printHelp(): void {
   console.log(`

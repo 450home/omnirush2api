@@ -903,7 +903,7 @@ var index_default = {
       const isUnhealthy = stats.total === 0;
       return jsonResponse({
         status: isBanned ? "banned" : isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
-        version: "1.0.0",
+        version: "1.0.1",
         mode: "cloudflare-worker",
         api_key_configured: Boolean(env.API_KEY && env.API_KEY.trim() !== ""),
         kv_storage_configured: Boolean(env.TOKEN_KV),
