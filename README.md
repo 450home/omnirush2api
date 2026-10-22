@@ -33,6 +33,7 @@
 - [Quick Start](#quick-start)
   - [Method 1: Local Daemon](#method-1-local-daemon)
   - [Method 2: Cloudflare Workers (Serverless)](#method-2-cloudflare-workers-serverless)
+  - [Method 3: Docker](#method-3-docker)
 - [Model Catalog & Aliases](#model-catalog--aliases)
 - [Client Integration](#client-integration)
 - [Architecture & Structure](#architecture--structure)
@@ -308,6 +309,50 @@ Your Cloudflare Worker API URL:
 ```
 https://omnirush2api.<your-subdomain>.workers.dev/v1
 ```
+
+### Method 3: Docker
+
+The image is multi-stage: the runtime carries **no npm dependencies** at all,
+so it stays small and starts instantly.
+
+**Build and run:**
+
+```bash
+git clone https://github.com/bhu-alw/Omnirush2API.git
+cd Omnirush2API
+
+docker build -t omnirush2api .
+
+docker run -d --name omnirush2api \
+  -p 20129:20129 \
+  -v omnirush-tokens:/root/.omnirush2api \
+  -e API_KEY=sk-omnirush \
+  -e OMNIRUSH_REFRESH_TOKEN="omr_xxx|omnirush-yyy" \
+  omnirush2api
+```
+
+**Or with Compose:**
+
+```bash
+cp .env.example .env    # then fill in your token
+docker compose up -d
+```
+
+**Get a token inside the container:**
+
+```bash
+docker run --rm -it omnirush2api node dist/cli.js login
+```
+
+**Check it is alive:**
+
+```bash
+curl http://127.0.0.1:20129/health
+curl http://127.0.0.1:20129/v1/models -H "Authorization: Bearer sk-omnirush"
+```
+
+The `omnirush-tokens` volume keeps the rotated refresh tokens across
+container replacements — without it every restart would need a fresh login.
 
 ## Model Catalog & Aliases
 
@@ -1047,13 +1092,106 @@ token_account_3"
 
 ### Environment Variables
 
-| Variable | Mode | Default | Description |
+Every environment variable the daemon reads, in one place:
+
+| Variable | Required | Default | Description |
 |---|---|---|---|
-| `PORT` | Local | `20129` | Local HTTP daemon port |
-| `HOST` | Local | `127.0.0.1` | Local bind address |
-| `API_KEY` | Both | *(None)* | Client authorization bearer token |
-| `OMNIRUSH_REFRESH_TOKEN` | Both | *(From tokens.json)*| Newline-separated list of refresh tokens |
-| `OMNIRUSH_GATEWAY_URL` | Both | `https://omnirush.ai/omnirush/v1` | Upstream Omnirush gateway URL |
+| `OMNIRUSH_REFRESH_TOKEN` | **Yes** *(unless a token file exists)* | *(from `~/.omnirush2api/tokens.json`)* | OAuth token pair(s). Format: `"<refresh_token>\|<access_token>"`. **Multiple accounts: one pair per line.** |
+| `API_KEY` | No | *(none — no auth required)* | Bearer key clients must send to this daemon, e.g. `sk-omnirush` |
+| `OMNIRUSH_GATEWAY_URL` | No | `https://omnirush.ai/omnirush/v1` | Upstream OmniRush gateway |
+| `PORT` | No | `20129` | Daemon listen port |
+| `HOST` | No | `127.0.0.1` | Daemon bind address (use `0.0.0.0` in a container) |
+
+> `OMNIRUSH_ACCESS_TOKEN` also exists, but you rarely need it: the refresh
+> token is enough — the daemon exchanges it for an access token itself and
+> rotates both automatically.
+
+#### How to add them
+
+**A. Docker Compose** — edit `docker-compose.yml`:
+
+```yaml
+services:
+  omnirush2api:
+    environment:
+      API_KEY: "sk-omnirush"
+      OMNIRUSH_REFRESH_TOKEN: "omr_xxx|omnirush-yyy"
+      PORT: "20129"
+      HOST: "0.0.0.0"
+```
+
+…or keep them out of the file, in a `.env` next to `docker-compose.yml`
+(`.env` is git-ignored and never committed):
+
+```bash
+cat > .env << 'EOF'
+API_KEY=sk-omnirush
+OMNIRUSH_REFRESH_TOKEN=omr_xxx|omnirush-yyy
+EOF
+docker compose up -d
+```
+
+**B. `docker run`** — pass them with `-e`:
+
+```bash
+docker run -d --name omnirush2api -p 20129:20129 \
+  -v omnirush-tokens:/root/.omnirush2api \
+  -e API_KEY=sk-omnirush \
+  -e OMNIRUSH_REFRESH_TOKEN="omr_xxx|omnirush-yyy" \
+  -e PORT=20129 \
+  -e HOST=0.0.0.0 \
+  omnirush2api
+```
+
+**C. Local process** — export them in the shell (or put them in your
+process manager / service unit):
+
+```bash
+export OMNIRUSH_REFRESH_TOKEN="omr_xxx|omnirush-yyy"
+export API_KEY=sk-omnirush
+node dist/cli.js start --port 20129 --host 127.0.0.1
+```
+
+**D. Cloudflare Workers** — Settings → Variables and Secrets, add them as
+**Secrets** (not plain text variables):
+
+| Name | Type | Value |
+|---|---|---|
+| `OMNIRUSH_REFRESH_TOKEN` | Secret | `"<refresh_token>\|<access_token>"` |
+| `API_KEY` | Secret | `sk-omnirush` |
+
+#### Where the token comes from
+
+Run the device flow and copy the pair it prints:
+
+```bash
+node dist/cli.js login          # local
+docker run --rm -it omnirush2api node dist/cli.js login   # container
+```
+
+```text
+========================================================
+   🎉 Omnirush OAuth Login Successful!
+========================================================
+Refresh Token: omr_xxx
+Access Token : omnirush-yyy
+```
+
+Paste them into `OMNIRUSH_REFRESH_TOKEN` as `omr_xxx|omnirush-yyy`.
+
+**You do not have to set `OMNIRUSH_REFRESH_TOKEN` at all** if the token file
+is present: the daemon reads `~/.omnirush2api/tokens.json` automatically
+(mount the `omnirush-tokens` volume to keep it across container
+replacements).
+
+#### Multiple accounts
+
+Newline-separated pairs; the daemon round-robins and fails over on 429:
+
+```bash
+OMNIRUSH_REFRESH_TOKEN="omr_acct1|omnirush_at1
+omr_acct2|omnirush_at2"
+```
 
 ## Development & Testing
 

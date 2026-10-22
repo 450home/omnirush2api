@@ -8,13 +8,15 @@ services:
       - "20129:20129"
     environment:
       # Bearer key clients must send to the local daemon.
-      API_KEY: "sk-omnirush"
+      API_KEY: "${API_KEY:-sk-omnirush}"
       # Upstream OmniRush gateway.
-      OMNIRUSH_GATEWAY_URL: "https://omnirush.ai/omnirush/v1"
+      OMNIRUSH_GATEWAY_URL: "${OMNIRUSH_GATEWAY_URL:-https://omnirush.ai/omnirush/v1}"
       # OAuth token pair: "<refresh_token>|<access_token>".
       # Get one with:  node dist/cli.js login
       # Leave it empty to use the token file in the mounted volume instead.
       OMNIRUSH_REFRESH_TOKEN: "${OMNIRUSH_REFRESH_TOKEN:-}"
+      PORT: "${PORT:-20129}"
+      HOST: "${HOST:-0.0.0.0}"
     volumes:
       # Rotated refresh tokens are persisted here; keep the volume so the
       # account survives a container replacement.
