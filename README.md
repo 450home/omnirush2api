@@ -1186,12 +1186,36 @@ replacements).
 
 #### Multiple accounts
 
-Newline-separated pairs; the daemon round-robins and fails over on 429:
+Newline- **or comma**-separated pairs; the daemon round-robins and fails over
+on 429:
 
 ```bash
 OMNIRUSH_REFRESH_TOKEN="omr_acct1|omnirush_at1
 omr_acct2|omnirush_at2"
 ```
+
+```bash
+# commas work too
+OMNIRUSH_REFRESH_TOKEN="omr_acct1|omnirush_at1,omr_acct2|omnirush_at2"
+```
+
+> **Quoting matters.** The `|` separates the two halves of a pair, so it must
+> survive the shell:
+>
+> ```bash
+> # ✗ the shell reads | as a pipe
+> -e OMNIRUSH_REFRESH_TOKEN=omr_xxx|omnirush-yyy
+> # ✓ quoted
+> -e OMNIRUSH_REFRESH_TOKEN="omr_xxx|omnirush-yyy"
+> ```
+>
+> In a `.env` file (read by Compose) and in YAML, an unquoted
+> `omr_xxx|omnirush-yyy` is fine — YAML only treats `|` specially when it is
+> the *first* character of a value. Quoting it is still the safe habit.
+
+> The access token half is used as-is: the daemon sends the request with it
+> and only refreshes when the gateway rejects it. A refresh token on its own
+> also works — the daemon exchanges it for an access token itself.
 
 ## Development & Testing
 
