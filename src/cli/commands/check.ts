@@ -13,7 +13,7 @@ export interface CheckCommandOptions {
 export async function runCheckCommand(options: CheckCommandOptions = {}): Promise<void> {
   const gatewayUrl = options.gatewayUrl || DEFAULT_GATEWAY_URL;
 
-  console.log("\n[Omnirush2API] Checking local OmniRush credentials and status...\n");
+  console.log("\n[omnirush2api] Checking local OmniRush credentials and status...\n");
 
   const [discovered, stored] = await Promise.all([
     findLocalCredentials(),

@@ -8,9 +8,9 @@ import { resolveModelId } from "./model-catalog.js";
 
 export interface OmnirushWirePayload {
   readonly model: string;
-  readonly messages: readonly unknown[];
-  readonly input?: readonly unknown[] | undefined;
+  readonly input: readonly unknown[];
   readonly stream: boolean;
+  readonly store: false;
   readonly temperature?: number | undefined;
   readonly top_p?: number | undefined;
   readonly max_tokens?: number | undefined;
@@ -28,7 +28,6 @@ export function normalizeCompletionRequest(
   request: ChatCompletionRequest
 ): OmnirushWirePayload {
   const targetModel = resolveModelId(request.model);
-  const stream = request.stream === true;
 
   // Determine reasoning configuration
   let reasoning: { effort: string; summary: string } | undefined;
@@ -46,9 +45,13 @@ export function normalizeCompletionRequest(
 
   return {
     model: targetModel,
-    messages: request.messages,
+    // The upstream /responses endpoint takes `input` only — a `messages`
+    // field is refused with "Unsupported parameter: messages".
     input: request.messages,
-    stream,
+    // The gateway refuses a non-streaming request ("Stream must be set to
+    // true") and requires store=false ("Store must be set to false").
+    stream: true,
+    store: false,
     ...(typeof request.temperature === "number" ? { temperature: request.temperature } : {}),
     ...(typeof request.top_p === "number" ? { top_p: request.top_p } : {}),
     ...(typeof request.max_tokens === "number" ? { max_tokens: request.max_tokens } : {}),

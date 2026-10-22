@@ -41,7 +41,7 @@ async function getOrCreatePool(env: WorkerEnv): Promise<AccountPoolManager> {
             `${account.refreshToken}|${account.accessToken ?? ""}`
           );
         } catch (err) {
-          console.error("[Omnirush2API Worker KV] Failed to store rotated token:", err);
+          console.error("[omnirush2api Worker KV] Failed to store rotated token:", err);
         }
       }
     });

@@ -162,6 +162,10 @@ export class AccountPoolManager {
       refreshToken: token,
       accessToken: initialToken ?? null,
       gatewayUrl: gatewayUrl || this.defaultGatewayUrl,
+      // A stored access token is not trusted to still be live: the gateway
+      // rotates it on every refresh, so a token read from disk can already be
+      // dead. Treating it as expired makes the pool refresh it up front
+      // instead of discovering the 401 on the first real request.
       expiresAt: initialToken ? Date.now() + 3600_000 : 0,
       cooldownUntil: 0,
       failureCount: 0,
@@ -204,7 +208,7 @@ export class AccountPoolManager {
     account.bannedReason = reason ?? "Account suspended/closed by upstream";
     account.cooldownUntil = Number.MAX_SAFE_INTEGER;
     console.error(
-      `[Omnirush2API Guard] 🚨 DANGER: Account ${account.id} was permanently BANNED/SUSPENDED by Omnirush: ${account.bannedReason}. Quarantined from pool.`
+      `[omnirush2api Guard] 🚨 DANGER: Account ${account.id} was permanently BANNED/SUSPENDED by Omnirush: ${account.bannedReason}. Quarantined from pool.`
     );
   }
 
@@ -218,7 +222,7 @@ export class AccountPoolManager {
     account.cooldownUntil = Date.now() + durationMs;
     account.failureCount++;
     console.warn(
-      `[Omnirush2API Pool] Account ${account.id} placed in cooldown for ${Math.round(durationMs / 1000)}s: ${reason ?? "Rate limit / Quota reached"}`
+      `[omnirush2api Pool] Account ${account.id} placed in cooldown for ${Math.round(durationMs / 1000)}s: ${reason ?? "Rate limit / Quota reached"}`
     );
   }
 
@@ -266,7 +270,7 @@ export class AccountPoolManager {
             try {
               await this.onTokenRotated(oldRefreshToken, candidate);
             } catch (err) {
-              console.error("[Omnirush2API Pool] onTokenRotated callback error:", err);
+              console.error("[omnirush2api Pool] onTokenRotated callback error:", err);
             }
           }
         } else {
@@ -321,6 +325,52 @@ export class AccountPoolManager {
       account.accessToken = null;
       account.expiresAt = 0;
     }
+  }
+
+  /**
+   * Forces a refresh of one account's access token.
+   *
+   * The gateway rotates the access token on every refresh, so a token that
+   * was stored on disk can already be dead when the daemon starts. Returns
+   * the fresh access token, or null when the refresh itself failed.
+   */
+  public async refreshAccountToken(accountId: string): Promise<string | null> {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return null;
+
+    const oldRefreshToken = account.refreshToken;
+    const refreshResult = await refreshDeviceToken(account.refreshToken, {
+      gatewayUrl: account.gatewayUrl,
+    });
+
+    if (!refreshResult.success || !refreshResult.accessToken) {
+      this.markCooldown(account.id, 60_000, refreshResult.error ?? "Token refresh failed");
+      return null;
+    }
+
+    account.accessToken = refreshResult.accessToken;
+    if (refreshResult.refreshToken) {
+      account.refreshToken = refreshResult.refreshToken;
+    }
+    if (refreshResult.gatewayUrl) {
+      account.gatewayUrl = refreshResult.gatewayUrl;
+    }
+    account.expiresAt = Date.now() + (refreshResult.expiresIn ?? 3600) * 1000;
+    account.failureCount = 0;
+
+    if (
+      this.onTokenRotated &&
+      refreshResult.refreshToken &&
+      refreshResult.refreshToken !== oldRefreshToken
+    ) {
+      try {
+        await this.onTokenRotated(oldRefreshToken, account);
+      } catch (err) {
+        console.error("[omnirush2api Pool] onTokenRotated callback error:", err);
+      }
+    }
+
+    return account.accessToken;
   }
 
   public getAllAccounts(): readonly AccountState[] {

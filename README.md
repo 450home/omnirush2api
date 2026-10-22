@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="./public/images/Omnirush2API_Banner.webp" alt="Omnirush2API Banner" width="100%">
+<img src="./public/images/omnirush2api_Banner.webp" alt="omnirush2api Banner" width="100%">
 
-# Omnirush2API
+# omnirush2api
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![npm version](https://img.shields.io/npm/v/omnirush2api.svg?logo=npm&logoColor=white)](https://www.npmjs.com/package/omnirush2api)
-[![CI](https://github.com/IMROVOID/Omnirush2API/actions/workflows/test.yml/badge.svg)](https://github.com/IMROVOID/Omnirush2API/actions/workflows/test.yml)
+[![CI](https://github.com/IMROVOID/omnirush2api/actions/workflows/test.yml/badge.svg)](https://github.com/IMROVOID/omnirush2api/actions/workflows/test.yml)
 [![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D20.0.0-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8.2-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
@@ -23,7 +23,7 @@
 
 ## Table of Contents
 
-- [What is Omnirush2API?](#what-is-omnirush2api)
+- [What is omnirush2api?](#what-is-omnirush2api)
 - [Key Features](#key-features)
 - [How to Get Your Refresh Token](#how-to-get-your-refresh-token)
   - [1. Automated Script (1-Click Browser Login)](#1-automated-script-recommended---1-click-login)
@@ -43,13 +43,13 @@
 - [Disclaimer & Legal Notice](#disclaimer--legal-notice)
 - [License](#license)
 
-## What is Omnirush2API?
+## What is omnirush2api?
 
 [Omnirush.ai](https://omnirush.ai) provides powerful frontier models including **GPT-6 Astra**, **GPT-6.1 Sol**, and **GPT-6 Sol**, delivering deep reasoning, intelligent coding agents, and high-throughput responses through its desktop platform.
 
 However, access to Omnirush quotas is locked behind OAuth device authentication within the official desktop client. Developers could not consume these models as standard OpenAI-compatible endpoints (`sk-...`) in third-party coding agents, test harnesses, or external IDEs.
 
-**Omnirush2API** bridges this gap:
+**omnirush2api** bridges this gap:
 
 1. It integrates with Omnirush's OAuth Device Flow (`omnirush2api login`) and automatically auto-discovers local credentials from the official desktop app on Windows, macOS, and Linux, proactively rotating access tokens before expiration.
 2. It serves a standard OpenAI-compatible gateway (`/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/v1/health`) with Server-Sent Events (SSE) streaming and deep thinking reasoning preservation (`delta.reasoning_content`).
@@ -132,7 +132,7 @@ omni_ref_a1b2c3d4e5f6...
 When running the **Local Daemon**, getting and managing the refresh token is **completely automatic**:
 
 - **Option A (Interactive Login)**: Run `npm run login` or `node dist/cli.js login`. The token is automatically persisted to `~/.omnirush2api/tokens.json`. You can start the daemon immediately with `node dist/cli.js start`.
-- **Option B (Auto-Discovery from Desktop App)**: If you already have the official [OmniRush Desktop](https://omnirush.ai) app installed and signed in, Omnirush2API **automatically discovers** your existing session from your system with zero setup. Run `node dist/cli.js check` to verify detection.
+- **Option B (Auto-Discovery from Desktop App)**: If you already have the official [OmniRush Desktop](https://omnirush.ai) app installed and signed in, omnirush2api **automatically discovers** your existing session from your system with zero setup. Run `node dist/cli.js check` to verify detection.
 - **Option C (Environment Variable)**: Export the token directly:
   ```bash
   export OMNIRUSH_REFRESH_TOKEN="omni_ref_your_token_here"
@@ -169,7 +169,7 @@ When deploying to **Cloudflare Workers**, Omnirush enforces single-use **Refresh
    - In your Worker settings under **KV Namespace Bindings**, bind `OMNIRUSH_TOKENS` with variable name: `TOKEN_KV`.
    - The worker will seamlessly persist and synchronize rotated tokens globally with zero 401s.
 
-> **Pro Tip (Multi-Account Pooling)**: You can paste multiple token pairs (one per line) into `OMNIRUSH_REFRESH_TOKEN`. Omnirush2API will automatically round-robin requests across all accounts and failover on 429 rate limits!
+> **Pro Tip (Multi-Account Pooling)**: You can paste multiple token pairs (one per line) into `OMNIRUSH_REFRESH_TOKEN`. omnirush2api will automatically round-robin requests across all accounts and failover on 429 rate limits!
 
 ---
 
@@ -209,8 +209,8 @@ You can copy the `"refresh_token"` value directly.
 Clone and install dependencies:
 
 ```bash
-git clone https://github.com/IMROVOID/Omnirush2API.git
-cd Omnirush2API
+git clone https://github.com/IMROVOID/omnirush2api.git
+cd omnirush2api
 npm install
 npm run build
 ```
@@ -238,7 +238,7 @@ node dist/cli.js check
 Example output:
 
 ```text
-[Omnirush2API] Checking local OmniRush credentials and status...
+[omnirush2api] Checking local OmniRush credentials and status...
 
 Found 1 unique OmniRush credential(s):
 
@@ -311,7 +311,7 @@ https://omnirush2api.<your-subdomain>.workers.dev/v1
 
 ## Model Catalog & Aliases
 
-Omnirush2API automatically maps requested model aliases to canonical upstream models:
+omnirush2api automatically maps requested model aliases to canonical upstream models:
 
 | Request Model Alias | Canonical Upstream Model | Context Limit | Max Output | Description |
 |---|---|---|---|---|
@@ -363,7 +363,7 @@ Configuration entry for `~/.9router/db.json`:
   "providers": [
     {
       "id": "omnirush2api",
-      "name": "Omnirush2API",
+      "name": "omnirush2api",
       "type": "openai",
       "baseUrl": "http://localhost:20129/v1",
       "apiKey": "sk-omnirush",
@@ -661,7 +661,7 @@ Add configuration:
 ```yaml
 endpoints:
   custom:
-    - name: "Omnirush2API"
+    - name: "omnirush2api"
       apiKey: "sk-omnirush"
       baseURL: "http://localhost:20129/v1"
       models:
@@ -919,7 +919,7 @@ Add configuration:
 {
   "modelProviders": [
     {
-      "name": "Omnirush2API",
+      "name": "omnirush2api",
       "apiType": "openai",
       "endpoint": "http://localhost:20129/v1",
       "apiKey": "sk-omnirush",
@@ -961,7 +961,7 @@ Add configuration:
 ## Architecture & Structure
 
 ```
-Omnirush2API/
+omnirush2api/
 ├── src/
 │   ├── types/
 │   │   ├── auth.ts              # OAuth contracts, pool states, device authorize models
@@ -1008,7 +1008,7 @@ Omnirush2API/
 Omnirush enforces automated account closure protections triggered by:
 > *"Your OmniRush account was closed automatically because its sign-in was used from another place at the same time or through an unofficial client, which our Terms of Service don't allow."*
 
-Omnirush2API includes built-in wire defenses to protect your accounts:
+omnirush2api includes built-in wire defenses to protect your accounts:
 
 1. **Official Desktop Client Masquerading**:
    - Outbound requests emulate the official OmniRush Electron desktop client (`OmniRush/1.2.4`, `Electron/32.2.0`, `Chrome/128.0`).
@@ -1028,7 +1028,7 @@ Omnirush2API includes built-in wire defenses to protect your accounts:
 
 ### Multi-Account Pooling & 429 Failover
 
-If an account reaches its quota limit, Omnirush2API automatically shifts traffic to the next account without interrupting your active coding session.
+If an account reaches its quota limit, omnirush2api automatically shifts traffic to the next account without interrupting your active coding session.
 
 In Cloudflare Workers or your local environment, pass multiple refresh tokens separated by newlines in `OMNIRUSH_REFRESH_TOKEN`:
 
@@ -1091,13 +1091,13 @@ To skip the test suite on specific commits (e.g. for docs updates or asset addit
 
 ## Disclaimer & Legal Notice
 
-> **IMPORTANT**: Please read this notice carefully before using or deploying Omnirush2API.
+> **IMPORTANT**: Please read this notice carefully before using or deploying omnirush2api.
 
 1. **Educational & Research Purposes Only**: This project is developed and distributed exclusively for personal educational, research, and non-commercial API interoperability testing purposes.
 2. **Risk of Account Suspension or Ban**: Extracting OAuth tokens, managing session credentials, or routing automated API requests outside the official Omnirush Desktop client may violate Omnirush's Terms of Service and End User License Agreements. Omnirush may rate-limit, revoke tokens for, suspend, or permanently ban your account without prior warning.
 3. **No Warranty & No Guarantee**: The author and contributors make no claims, promises, or guarantees regarding the safety, status, or longevity of your Omnirush account. This software is provided "AS IS", without warranty of any kind, express or implied.
 4. **Assumption of Risk**: You assume full and sole responsibility for any outcomes or damages resulting from using this software, including but not limited to account termination, loss of API access, or data loss. Use strictly at your own risk.
-5. **Trademark Attribution**: All product names, logos, and brands (such as "Omnirush", "GPT-6 Astra", "GPT-6 Sol") are trademarks or registered trademarks of their respective owners. Omnirush2API is an independent open-source project and is neither affiliated with, maintained by, nor endorsed by Omnirush.ai.
+5. **Trademark Attribution**: All product names, logos, and brands (such as "Omnirush", "GPT-6 Astra", "GPT-6 Sol") are trademarks or registered trademarks of their respective owners. omnirush2api is an independent open-source project and is neither affiliated with, maintained by, nor endorsed by Omnirush.ai.
 
 ## License
 

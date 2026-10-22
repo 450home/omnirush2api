@@ -21,7 +21,7 @@ describe("normalizer", () => {
     const normalized = normalizeCompletionRequest(rawReq);
     assert.equal(normalized.model, "gpt-6-astra");
     assert.equal(normalized.stream, true);
-    assert.equal(normalized.messages.length, 2);
+    assert.equal(normalized.input.length, 2);
     assert.deepEqual(normalized.reasoning, { effort: "high", summary: "auto" });
   });
 

@@ -2,7 +2,7 @@ import { runLoginCommand } from "../src/cli/commands/login.js";
 
 async function main(): Promise<void> {
   console.log("\n========================================================");
-  console.log("   Omnirush2API - Device OAuth Login & Token Retriever  ");
+  console.log("   omnirush2api - Device OAuth Login & Token Retriever  ");
   console.log("========================================================\n");
 
   // Always initiate an interactive OAuth login flow to obtain a fresh token

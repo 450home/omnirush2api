@@ -30,9 +30,9 @@ export async function runLoginCommand(options: LoginCommandOptions = {}): Promis
   const shouldOpenBrowser = options.openBrowser ?? true;
 
   console.log("\n==================================================");
-  console.log("       Omnirush2API - Device OAuth Login          ");
+  console.log("       omnirush2api - Device OAuth Login          ");
   console.log("==================================================\n");
-  console.log(`[Omnirush2API] Connecting to gateway: ${gatewayUrl}`);
+  console.log(`[omnirush2api] Connecting to gateway: ${gatewayUrl}`);
 
   try {
     const authSession = await initiateDeviceFlow({ gatewayUrl });

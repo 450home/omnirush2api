@@ -1,0 +1,34 @@
+services:
+  omnirush2api:
+    build: .
+    image: omnirush2api:latest
+    container_name: omnirush2api
+    restart: unless-stopped
+    ports:
+      - "20129:20129"
+    environment:
+      # Bearer key clients must send to the local daemon.
+      API_KEY: "sk-omnirush"
+      # Upstream OmniRush gateway.
+      OMNIRUSH_GATEWAY_URL: "https://omnirush.ai/omnirush/v1"
+      # OAuth token pair: "<refresh_token>|<access_token>".
+      # Get one with:  node dist/cli.js login
+      # Leave it empty to use the token file in the mounted volume instead.
+      OMNIRUSH_REFRESH_TOKEN: "${OMNIRUSH_REFRESH_TOKEN:-}"
+    volumes:
+      # Rotated refresh tokens are persisted here; keep the volume so the
+      # account survives a container replacement.
+      - omnirush-tokens:/root/.omnirush2api
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:20129/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  omnirush-tokens:

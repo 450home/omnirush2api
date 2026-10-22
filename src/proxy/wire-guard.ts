@@ -16,7 +16,7 @@ export interface AccountBanCheckResult {
   readonly reason?: string | undefined;
 }
 
-export const OFFICIAL_VERSION = "2.4.3";
+export const OFFICIAL_VERSION = "2.6.7";
 
 const BAN_PATTERNS: readonly RegExp[] = [
   /closed\s+automatically/i,
@@ -84,21 +84,22 @@ export function generateRealisticDeviceName(): string {
  * Constructs official headers for model requests (/responses, /chat/completions)
  * Matches official token-proxy.js lines 278-295:
  * - User-Agent: "omnirush" (bare product name, versioned "omnirush/x" is refused as lookalike)
- * - X-OmniRush-Client: "cli/2.4.3"
- * - x-omnirush-session-id: <uuid>
+ * - X-OmniRush-Client: "cli/<version>"
+ *
+ * NOTE: x-omnirush-session-id is deliberately NOT sent. The official
+ * token-proxy only forwards it when the engine itself supplied X-Session-Id
+ * (a session the gateway already knows). A made-up value makes the gateway
+ * answer 403 official_client_required; omitting the header is accepted.
  */
 export function createAntiBanHeaders(
   options: AntiBanHeaderOptions
 ): Record<string, string> {
-  const sessionId = options.requestId ?? `sess-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: options.isStream ? "text/event-stream" : "application/json",
     Authorization: `Bearer ${options.accessToken}`,
     "User-Agent": "omnirush",
     "X-OmniRush-Client": `cli/${OFFICIAL_VERSION}`,
-    "x-omnirush-session-id": sessionId,
   };
 
   return headers;

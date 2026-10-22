@@ -1,7 +1,7 @@
 {
   "name": "omnirush2api",
-  "version": "1.0.1",
-  "description": "OAuth to OpenAI-compatible API router for Omnirush.ai models",
+  "version": "1.0.0",
+  "description": "OAuth to OpenAI-compatible API router for Omnirush.ai models (Docker-ready, with upstream protocol fixes)",
   "type": "module",
   "main": "./dist/cli.js",
   "bin": {
@@ -38,12 +38,12 @@
   "license": "GPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/IMROVOID/Omnirush2API.git"
+    "url": "git+https://github.com/bhu-alw/omnirush2api.git"
   },
   "bugs": {
-    "url": "https://github.com/IMROVOID/Omnirush2API/issues"
+    "url": "https://github.com/bhu-alw/omnirush2api/issues"
   },
-  "homepage": "https://github.com/IMROVOID/Omnirush2API#readme",
+  "homepage": "https://github.com/bhu-alw/omnirush2api#readme",
   "devDependencies": {
     "@types/node": "^22.13.9",
     "esbuild": "^0.25.0",

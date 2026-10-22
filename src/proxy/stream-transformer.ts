@@ -117,6 +117,47 @@ export function transformUpstreamChunk(
     };
   }
 
+  // Handle the Responses API event format the gateway actually speaks:
+  // { type: "response.output_text.delta", delta: "..." } and
+  // { type: "response.reasoning_summary_text.delta", delta: "..." }
+  const eventType = typeof upstream["type"] === "string" ? (upstream["type"] as string) : "";
+  if (eventType === "response.output_text.delta" && typeof upstream["delta"] === "string") {
+    return createChunkDelta({
+      id,
+      model: requestedModel,
+      content: upstream["delta"],
+    });
+  }
+
+  if (
+    eventType === "response.reasoning_summary_text.delta" &&
+    typeof upstream["delta"] === "string"
+  ) {
+    return createChunkDelta({
+      id,
+      model: requestedModel,
+      reasoningContent: upstream["delta"],
+    });
+  }
+
+  // An upstream `event: error` frame carries a failure inside a 200 body.
+  // Surface it as an OpenAI error chunk instead of dropping it silently.
+  if (eventType === "error" || eventType === "response.failed") {
+    const errObj = upstream["error"];
+    const message =
+      errObj && typeof errObj === "object" && typeof (errObj as Record<string, unknown>)["message"] === "string"
+        ? ((errObj as Record<string, unknown>)["message"] as string)
+        : "Upstream error";
+    return {
+      id,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: requestedModel,
+      choices: [],
+      error: { message, type: "upstream_error" },
+    } as unknown as ChatCompletionChunk;
+  }
+
   // Handle alternative Responses API delta format
   if (typeof upstream["delta"] === "string") {
     return createChunkDelta({

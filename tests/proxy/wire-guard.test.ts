@@ -42,17 +42,19 @@ describe("anti-ban wire guard & ban protection", () => {
       assert.ok(!val.toLowerCase().includes("omnirush2api"), `Header value leaked unofficial name: ${val}`);
     }
 
-    // Required official client signatures (matching omnirush@2.4.3 token-proxy.js)
+    // Required official client signatures (matching omnirush@2.6.7 token-proxy.js)
     assert.equal(headers["User-Agent"], "omnirush");
-    assert.equal(headers["X-OmniRush-Client"], "cli/2.4.3");
-    assert.equal(headers["x-omnirush-session-id"], "sess-123");
+    assert.equal(headers["X-OmniRush-Client"], "cli/2.6.7");
+    // A made-up x-omnirush-session-id is refused by the gateway with 403,
+    // so the header is deliberately not sent.
+    assert.equal(headers["x-omnirush-session-id"], undefined);
     assert.equal(headers["Authorization"], "Bearer mock_acc_token");
     assert.equal(headers["Accept"], "text/event-stream");
 
     // Test official auth API headers
     const authHeaders = createAuthApiHeaders();
-    assert.ok(authHeaders["User-Agent"]?.startsWith("omnirush/2.4.3 ("));
-    assert.equal(authHeaders["X-OmniRush-Client"], "cli/2.4.3");
+    assert.ok(authHeaders["User-Agent"]?.startsWith("omnirush/2.6.7 ("));
+    assert.equal(authHeaders["X-OmniRush-Client"], "cli/2.6.7");
   });
 
   it("generates realistic device names and platform signatures", () => {

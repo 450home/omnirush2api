@@ -1,0 +1,43 @@
+# Dependencies (the runtime image needs none of them)
+node_modules
+npm-debug.log*
+yarn-error.log*
+
+# Build outputs — rebuilt inside the image
+dist
+worker
+*.tsbuildinfo
+*.js.map
+.d.ts.map
+
+# VCS
+.git
+.gitignore
+.github
+
+# Tests (not needed to run the daemon)
+tests
+
+# Local secrets and configs
+.env
+.env.*
+!.env.example
+
+# Caches
+.wrangler
+.turbo
+.cache
+.esbuild
+coverage
+*.log
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Docs that do not belong in the image
+docs
+*.md
+!README.md

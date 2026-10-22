@@ -14,8 +14,11 @@ export interface StartCommandOptions {
 }
 
 export async function runStartCommand(options: StartCommandOptions = {}): Promise<void> {
-  const port = options.port ?? 20129;
-  const host = options.host ?? "127.0.0.1";
+  // PORT / HOST let a container set the listen address without rewriting the
+  // command line; the explicit flags still win.
+  const envPort = Number.parseInt(process.env["PORT"] ?? "", 10);
+  const port = options.port ?? (Number.isInteger(envPort) ? envPort : 20129);
+  const host = options.host ?? process.env["HOST"] ?? "127.0.0.1";
   const apiKey = options.key || process.env["API_KEY"];
   const gatewayUrl = options.gatewayUrl || process.env["OMNIRUSH_GATEWAY_URL"] || DEFAULT_GATEWAY_URL;
 
@@ -30,9 +33,9 @@ export async function runStartCommand(options: StartCommandOptions = {}): Promis
         },
         oldToken
       );
-      console.log(`[Omnirush2API RTR] Persisted rotated refresh token to disk (${account.email ?? account.id})`);
+      console.log(`[omnirush2api RTR] Persisted rotated refresh token to disk (${account.email ?? account.id})`);
     } catch (err) {
-      console.error(`[Omnirush2API RTR] Failed to persist rotated token:`, err);
+      console.error(`[omnirush2api RTR] Failed to persist rotated token:`, err);
     }
   });
 
@@ -56,7 +59,7 @@ export async function runStartCommand(options: StartCommandOptions = {}): Promis
   const stats = pool.getStats();
 
   console.log("\n========================================================");
-  console.log("   Omnirush2API - OpenAI Reverse Proxy & OAuth Router   ");
+  console.log("   omnirush2api - OpenAI Reverse Proxy & OAuth Router   ");
   console.log("========================================================\n");
   console.log(`✓ Listening:           http://${host}:${port}/v1`);
   console.log(`✓ Health Check:        http://${host}:${port}/health`);
@@ -81,7 +84,7 @@ export async function runStartCommand(options: StartCommandOptions = {}): Promis
   const runningServer = await startHttpServer(config, pool);
 
   const shutdown = async (): Promise<void> => {
-    console.log("\n[Omnirush2API] Shutting down server gracefully...");
+    console.log("\n[omnirush2api] Shutting down server gracefully...");
     await runningServer.stop();
     process.exit(0);
   };

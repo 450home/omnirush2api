@@ -57,7 +57,7 @@ function getModelList() {
 }
 
 // src/proxy/wire-guard.ts
-var OFFICIAL_VERSION = "2.4.3";
+var OFFICIAL_VERSION = "2.6.7";
 var BAN_PATTERNS = [
   /closed\s+automatically/i,
   /unofficial\s+client/i,
@@ -90,14 +90,12 @@ function detectPlatformSignature() {
   return "win32";
 }
 function createAntiBanHeaders(options) {
-  const sessionId = options.requestId ?? `sess-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   const headers = {
     "Content-Type": "application/json",
     Accept: options.isStream ? "text/event-stream" : "application/json",
     Authorization: `Bearer ${options.accessToken}`,
     "User-Agent": "omnirush",
-    "X-OmniRush-Client": `cli/${OFFICIAL_VERSION}`,
-    "x-omnirush-session-id": sessionId
+    "X-OmniRush-Client": `cli/${OFFICIAL_VERSION}`
   };
   return headers;
 }
@@ -281,6 +279,10 @@ var AccountPoolManager = class {
       refreshToken: token,
       accessToken: initialToken ?? null,
       gatewayUrl: gatewayUrl || this.defaultGatewayUrl,
+      // A stored access token is not trusted to still be live: the gateway
+      // rotates it on every refresh, so a token read from disk can already be
+      // dead. Treating it as expired makes the pool refresh it up front
+      // instead of discovering the 401 on the first real request.
       expiresAt: initialToken ? Date.now() + 36e5 : 0,
       cooldownUntil: 0,
       failureCount: 0,
@@ -318,7 +320,7 @@ var AccountPoolManager = class {
     account.bannedReason = reason ?? "Account suspended/closed by upstream";
     account.cooldownUntil = Number.MAX_SAFE_INTEGER;
     console.error(
-      `[Omnirush2API Guard] \u{1F6A8} DANGER: Account ${account.id} was permanently BANNED/SUSPENDED by Omnirush: ${account.bannedReason}. Quarantined from pool.`
+      `[omnirush2api Guard] \u{1F6A8} DANGER: Account ${account.id} was permanently BANNED/SUSPENDED by Omnirush: ${account.bannedReason}. Quarantined from pool.`
     );
   }
   /**
@@ -330,7 +332,7 @@ var AccountPoolManager = class {
     account.cooldownUntil = Date.now() + durationMs;
     account.failureCount++;
     console.warn(
-      `[Omnirush2API Pool] Account ${account.id} placed in cooldown for ${Math.round(durationMs / 1e3)}s: ${reason ?? "Rate limit / Quota reached"}`
+      `[omnirush2api Pool] Account ${account.id} placed in cooldown for ${Math.round(durationMs / 1e3)}s: ${reason ?? "Rate limit / Quota reached"}`
     );
   }
   /**
@@ -367,7 +369,7 @@ var AccountPoolManager = class {
             try {
               await this.onTokenRotated(oldRefreshToken, candidate);
             } catch (err) {
-              console.error("[Omnirush2API Pool] onTokenRotated callback error:", err);
+              console.error("[omnirush2api Pool] onTokenRotated callback error:", err);
             }
           }
         } else {
@@ -417,6 +419,42 @@ var AccountPoolManager = class {
       account.expiresAt = 0;
     }
   }
+  /**
+   * Forces a refresh of one account's access token.
+   *
+   * The gateway rotates the access token on every refresh, so a token that
+   * was stored on disk can already be dead when the daemon starts. Returns
+   * the fresh access token, or null when the refresh itself failed.
+   */
+  async refreshAccountToken(accountId) {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return null;
+    const oldRefreshToken = account.refreshToken;
+    const refreshResult = await refreshDeviceToken(account.refreshToken, {
+      gatewayUrl: account.gatewayUrl
+    });
+    if (!refreshResult.success || !refreshResult.accessToken) {
+      this.markCooldown(account.id, 6e4, refreshResult.error ?? "Token refresh failed");
+      return null;
+    }
+    account.accessToken = refreshResult.accessToken;
+    if (refreshResult.refreshToken) {
+      account.refreshToken = refreshResult.refreshToken;
+    }
+    if (refreshResult.gatewayUrl) {
+      account.gatewayUrl = refreshResult.gatewayUrl;
+    }
+    account.expiresAt = Date.now() + (refreshResult.expiresIn ?? 3600) * 1e3;
+    account.failureCount = 0;
+    if (this.onTokenRotated && refreshResult.refreshToken && refreshResult.refreshToken !== oldRefreshToken) {
+      try {
+        await this.onTokenRotated(oldRefreshToken, account);
+      } catch (err) {
+        console.error("[omnirush2api Pool] onTokenRotated callback error:", err);
+      }
+    }
+    return account.accessToken;
+  }
   getAllAccounts() {
     return this.accounts;
   }
@@ -425,7 +463,6 @@ var AccountPoolManager = class {
 // src/proxy/normalizer.ts
 function normalizeCompletionRequest(request) {
   const targetModel = resolveModelId(request.model);
-  const stream = request.stream === true;
   let reasoning;
   if (request.reasoning_effort) {
     reasoning = {
@@ -440,9 +477,13 @@ function normalizeCompletionRequest(request) {
   }
   return {
     model: targetModel,
-    messages: request.messages,
+    // The upstream /responses endpoint takes `input` only — a `messages`
+    // field is refused with "Unsupported parameter: messages".
     input: request.messages,
-    stream,
+    // The gateway refuses a non-streaming request ("Stream must be set to
+    // true") and requires store=false ("Store must be set to false").
+    stream: true,
+    store: false,
     ...typeof request.temperature === "number" ? { temperature: request.temperature } : {},
     ...typeof request.top_p === "number" ? { top_p: request.top_p } : {},
     ...typeof request.max_tokens === "number" ? { max_tokens: request.max_tokens } : {},
@@ -590,6 +631,33 @@ function transformUpstreamChunk(upstream, requestedModel) {
       choices
     };
   }
+  const eventType = typeof upstream["type"] === "string" ? upstream["type"] : "";
+  if (eventType === "response.output_text.delta" && typeof upstream["delta"] === "string") {
+    return createChunkDelta({
+      id,
+      model: requestedModel,
+      content: upstream["delta"]
+    });
+  }
+  if (eventType === "response.reasoning_summary_text.delta" && typeof upstream["delta"] === "string") {
+    return createChunkDelta({
+      id,
+      model: requestedModel,
+      reasoningContent: upstream["delta"]
+    });
+  }
+  if (eventType === "error" || eventType === "response.failed") {
+    const errObj = upstream["error"];
+    const message = errObj && typeof errObj === "object" && typeof errObj["message"] === "string" ? errObj["message"] : "Upstream error";
+    return {
+      id,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1e3),
+      model: requestedModel,
+      choices: [],
+      error: { message, type: "upstream_error" }
+    };
+  }
   if (typeof upstream["delta"] === "string") {
     return createChunkDelta({
       id,
@@ -644,6 +712,126 @@ function createSSETransformStream(requestedModel) {
   });
 }
 
+// src/proxy/responses-aggregator.ts
+function extractSseError(sseText) {
+  for (const line of sseText.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload.startsWith("{")) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (parsed["type"] !== "error" && parsed["type"] !== "response.failed") continue;
+    const err = parsed["error"];
+    if (err && typeof err === "object") {
+      const e = err;
+      const message = typeof e["message"] === "string" ? e["message"] : "Upstream error";
+      const code = typeof e["code"] === "string" ? e["code"] : void 0;
+      return { message, code };
+    }
+    return { message: "Upstream error", code: void 0 };
+  }
+  return null;
+}
+function aggregateResponsesSse(sseText, fallbackModel) {
+  let id = `chatcmpl-${Date.now()}`;
+  let model = fallbackModel;
+  let text = "";
+  let reasoning = "";
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let error;
+  let errorCode;
+  const sseError = extractSseError(sseText);
+  if (sseError) {
+    error = sseError.message;
+    errorCode = sseError.code;
+  }
+  for (const line of sseText.split("\n")) {
+    const parsed = parseSSELine(line);
+    if (parsed === null || parsed === "[DONE]") continue;
+    const event = parsed;
+    const type = typeof event["type"] === "string" ? event["type"] : "";
+    if (type === "response.created" || type === "response.in_progress") {
+      const resp = event["response"];
+      if (resp && typeof resp === "object") {
+        const r = resp;
+        if (typeof r["id"] === "string") id = r["id"];
+        if (typeof r["model"] === "string") model = r["model"];
+      }
+      continue;
+    }
+    if (type === "response.output_text.delta" && typeof event["delta"] === "string") {
+      text += event["delta"];
+      continue;
+    }
+    if (type === "response.reasoning_summary_text.delta" && typeof event["delta"] === "string") {
+      reasoning += event["delta"];
+      continue;
+    }
+    if (type === "response.completed" || type === "response.incomplete") {
+      const resp = event["response"];
+      if (resp && typeof resp === "object") {
+        const r = resp;
+        if (typeof r["id"] === "string") id = r["id"];
+        if (typeof r["model"] === "string") model = r["model"];
+        const usage = r["usage"];
+        if (usage && typeof usage === "object") {
+          const u = usage;
+          if (typeof u["input_tokens"] === "number") promptTokens = u["input_tokens"];
+          if (typeof u["output_tokens"] === "number") completionTokens = u["output_tokens"];
+          if (typeof u["total_tokens"] === "number") {
+            promptTokens = promptTokens || u["total_tokens"];
+          }
+        }
+        if (!text) {
+          const output = r["output"];
+          if (Array.isArray(output)) {
+            for (const item of output) {
+              if (!item || typeof item !== "object") continue;
+              const content = item["content"];
+              if (!Array.isArray(content)) continue;
+              for (const part of content) {
+                if (!part || typeof part !== "object") continue;
+                const t = part["text"];
+                if (typeof t === "string") text += t;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return { id, model, text, reasoning, promptTokens, completionTokens, error, errorCode };
+}
+function aggregatedToChatCompletion(agg, fallbackModel) {
+  const choice = {
+    index: 0,
+    message: {
+      role: "assistant",
+      content: agg.text,
+      ...agg.reasoning ? { reasoning_content: agg.reasoning } : {}
+    },
+    finish_reason: "stop"
+  };
+  const usage = {
+    prompt_tokens: agg.promptTokens,
+    completion_tokens: agg.completionTokens,
+    total_tokens: agg.promptTokens + agg.completionTokens
+  };
+  return {
+    id: agg.id.startsWith("resp_") ? `chatcmpl-${agg.id.slice(5, 21)}` : agg.id,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1e3),
+    model: agg.model || fallbackModel,
+    choices: [choice],
+    usage
+  };
+}
+
 // src/proxy/completion-handler.ts
 function generateRequestId() {
   if (typeof globalThis.crypto?.randomUUID === "function") {
@@ -651,6 +839,7 @@ function generateRequestId() {
   }
   return `req-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 }
+var RETRY = Symbol("retry");
 var CompletionProxyHandler = class {
   pool;
   upstreamBaseUrl;
@@ -659,6 +848,136 @@ var CompletionProxyHandler = class {
     this.pool = options.pool;
     this.upstreamBaseUrl = options.upstreamBaseUrl ?? DEFAULT_GATEWAY_URL;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 12e4;
+  }
+  /**
+   * Turns an upstream response into a client answer.
+   *
+   * Returns RETRY when the account should be skipped and the request
+   * retried (upstream overload, rate limit, ban, dead token).
+   */
+  async readUpstreamResponse(response, targetModel, isStream, accountId) {
+    if (isStream && response.ok && response.body) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let peeked = "";
+      const peekedBytes = [];
+      while (peekedBytes.length === 0 || !peeked.includes("\n\n")) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          peekedBytes.push(value);
+          peeked += decoder.decode(value, { stream: true });
+        }
+        if (peeked.length > 8192) break;
+      }
+      if (peeked.includes("event: error")) {
+        await reader.cancel().catch(() => void 0);
+        this.pool.markCooldown(
+          accountId,
+          5e3,
+          `Upstream SSE error: ${extractSseError(peeked)?.code ?? "unknown"}`
+        );
+        return RETRY;
+      }
+      const replay = new ReadableStream({
+        start(controller) {
+          for (const chunk of peekedBytes) controller.enqueue(chunk);
+          controller.close();
+        }
+      });
+      const rest = new ReadableStream({
+        start(controller) {
+          void (async () => {
+            try {
+              for (; ; ) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value) controller.enqueue(value);
+              }
+              controller.close();
+            } catch (err) {
+              controller.error(err);
+            }
+          })();
+        }
+      });
+      const combined = new ReadableStream({
+        start(controller) {
+          void (async () => {
+            try {
+              for await (const chunk of replay) {
+                controller.enqueue(chunk);
+              }
+              for await (const chunk of rest) {
+                controller.enqueue(chunk);
+              }
+              controller.close();
+            } catch (err) {
+              controller.error(err);
+            }
+          })();
+        }
+      });
+      const transformedStream = combined.pipeThrough(createSSETransformStream(targetModel));
+      return { status: 200, isStream: true, streamResponse: transformedStream };
+    }
+    const responseText = await response.text();
+    if (response.ok && (responseText.trimStart().startsWith("event:") || responseText.includes("data:"))) {
+      const agg = aggregateResponsesSse(responseText, targetModel);
+      if (agg.error) {
+        this.pool.markCooldown(
+          accountId,
+          5e3,
+          `Upstream SSE error: ${agg.errorCode ?? "unknown"}`
+        );
+        return RETRY;
+      }
+      return {
+        status: 200,
+        isStream: false,
+        jsonResponse: aggregatedToChatCompletion(agg, targetModel)
+      };
+    }
+    const banCheck = detectAccountBan(response.status, responseText);
+    if (banCheck.isBanned) {
+      this.pool.markBanned(accountId, banCheck.reason);
+      return RETRY;
+    }
+    if (response.status === 429) {
+      const retryAfter = response.headers.get("retry-after");
+      const cooldownMs = parseCooldownDuration(retryAfter, responseText);
+      this.pool.markCooldown(accountId, cooldownMs, `HTTP 429: ${responseText.slice(0, 100)}`);
+      return RETRY;
+    }
+    let parsedJson = {};
+    try {
+      parsedJson = JSON.parse(responseText);
+    } catch {
+      return {
+        status: response.status,
+        isStream: false,
+        errorResponse: {
+          error: {
+            message: `Invalid JSON from OmniRush gateway: ${responseText.slice(0, 200)}`,
+            type: "gateway_error"
+          }
+        }
+      };
+    }
+    if (response.ok) {
+      return {
+        status: 200,
+        isStream: false,
+        jsonResponse: normalizeCompletionResponse(parsedJson, targetModel)
+      };
+    }
+    return {
+      status: response.status,
+      isStream: false,
+      errorResponse: parsedJson ?? {
+        error: { message: `Gateway error (${response.status})`, type: "gateway_error" }
+      }
+    };
   }
   async handleCompletion(request, signal) {
     if (signal?.aborted) {
@@ -717,75 +1036,43 @@ var CompletionProxyHandler = class {
       const headers = createAntiBanHeaders({
         accessToken: account.accessToken ?? "",
         requestId,
-        isStream
+        // The gateway always answers a model request as an SSE stream, and
+        // only sends the output_text.delta frames when the client asks for
+        // event-stream. A client that wanted stream:false still gets the
+        // frames and has them collapsed into one JSON body further down.
+        isStream: true
       });
       const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
       const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-      try {
-        const response = await this.pool.withAccountLock(account.id, async () => {
-          return await fetch(`${gatewayUrl}/responses`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(normalizedPayload),
-            signal: combinedSignal
-          });
+      const send = async () => await this.pool.withAccountLock(account.id, async () => {
+        return await fetch(`${gatewayUrl}/responses`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(normalizedPayload),
+          signal: combinedSignal
         });
-        if (isStream && response.ok && response.body) {
-          const transformedStream = response.body.pipeThrough(
-            createSSETransformStream(targetModel)
-          );
-          return {
-            status: 200,
-            isStream: true,
-            streamResponse: transformedStream
-          };
-        }
-        const responseText = await response.text();
-        const banCheck = detectAccountBan(response.status, responseText);
-        if (banCheck.isBanned) {
-          this.pool.markBanned(account.id, banCheck.reason);
-          continue;
-        }
+      });
+      try {
+        let response = await send();
         if (response.status === 401) {
-          this.pool.invalidateAccountToken(account.id);
-          this.pool.markCooldown(account.id, 1e4, "HTTP 401 Unauthorized");
-          continue;
-        }
-        if (response.status === 429) {
-          const retryAfter = response.headers.get("retry-after");
-          const cooldownMs = parseCooldownDuration(retryAfter, responseText);
-          this.pool.markCooldown(account.id, cooldownMs, `HTTP 429: ${responseText.slice(0, 100)}`);
-          continue;
-        }
-        let parsedJson = {};
-        try {
-          parsedJson = JSON.parse(responseText);
-        } catch {
-          return {
-            status: response.status,
-            isStream: false,
-            errorResponse: {
-              error: {
-                message: `Invalid JSON from OmniRush gateway: ${responseText.slice(0, 200)}`,
-                type: "gateway_error"
-              }
-            }
-          };
-        }
-        if (response.ok) {
-          return {
-            status: 200,
-            isStream: false,
-            jsonResponse: normalizeCompletionResponse(parsedJson, targetModel)
-          };
-        }
-        return {
-          status: response.status,
-          isStream: false,
-          errorResponse: parsedJson ?? {
-            error: { message: `Gateway error (${response.status})`, type: "gateway_error" }
+          const fresh = await this.pool.refreshAccountToken(account.id);
+          if (fresh) {
+            headers["Authorization"] = `Bearer ${fresh}`;
+            response = await send();
           }
-        };
+          if (response.status === 401) {
+            this.pool.invalidateAccountToken(account.id);
+            this.pool.markCooldown(account.id, 1e4, "HTTP 401 Unauthorized");
+            continue;
+          }
+        }
+        const result = await this.readUpstreamResponse(
+          response,
+          targetModel,
+          isStream,
+          account.id
+        );
+        if (result !== RETRY) return result;
       } catch (err) {
         if (signal?.aborted) {
           return {
@@ -846,7 +1133,7 @@ async function getOrCreatePool(env) {
             `${account.refreshToken}|${account.accessToken ?? ""}`
           );
         } catch (err) {
-          console.error("[Omnirush2API Worker KV] Failed to store rotated token:", err);
+          console.error("[omnirush2api Worker KV] Failed to store rotated token:", err);
         }
       }
     });

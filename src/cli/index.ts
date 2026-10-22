@@ -8,7 +8,7 @@ const VERSION = "1.0.1";
 
 function printHelp(): void {
   console.log(`
-Omnirush2API v${VERSION}
+omnirush2api v${VERSION}
 OAuth to OpenAI-compatible API router for Omnirush.ai
 
 Usage:
@@ -111,6 +111,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error("[Omnirush2API] Fatal error:", err);
+  console.error("[omnirush2api] Fatal error:", err);
   process.exit(1);
 });
