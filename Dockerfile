@@ -74,8 +74,10 @@ USER node
 # The health endpoint answers 401 when API_KEY is set, so the check sends the
 # key as a bearer token. Without this the container would stay "unhealthy"
 # forever even though the daemon is fine.
+# It reads PORT from the environment so it still probes the right port when a
+# platform (Railway) assigns its own.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:20129/health',{headers:{authorization:'Bearer '+(process.env.API_KEY||'')}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "const p=process.env.PORT||20129;fetch('http://127.0.0.1:'+p+'/health',{headers:{authorization:'Bearer '+(process.env.API_KEY||'')}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # Gateway URL, bearer key for incoming clients, and the OAuth token pair
 # (refresh|access) can all be set as env vars.
@@ -84,4 +86,8 @@ ENV OMNIRUSH_GATEWAY_URL="https://omnirush.ai/omnirush/v1" \
     PORT="20129" \
     HOST="0.0.0.0"
 
-CMD ["node", "dist/cli.js", "start", "--port", "20129", "--host", "0.0.0.0"]
+# Do NOT hardcode --port/--host here: a platform such as Railway injects its
+# own PORT, and an explicit CLI flag would override it (the daemon would then
+# listen on the wrong port and fail its health probe). The daemon reads PORT
+# and HOST from the environment, so leaving them out lets the platform win.
+CMD ["node", "dist/cli.js", "start"]
