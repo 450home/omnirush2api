@@ -6,7 +6,7 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![npm version](https://img.shields.io/npm/v/omnirush2api.svg?logo=npm&logoColor=white)](https://www.npmjs.com/package/omnirush2api)
-[![CI](https://github.com/IMROVOID/omnirush2api/actions/workflows/test.yml/badge.svg)](https://github.com/IMROVOID/omnirush2api/actions/workflows/test.yml)
+[![CI](https://github.com/450home/omnirush2api/actions/workflows/test.yml/badge.svg)](https://github.com/450home/omnirush2api/actions/workflows/test.yml)
 [![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D20.0.0-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8.2-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
@@ -210,7 +210,7 @@ You can copy the `"refresh_token"` value directly.
 Clone and install dependencies:
 
 ```bash
-git clone https://github.com/IMROVOID/omnirush2api.git
+git clone https://github.com/450home/omnirush2api.git
 cd omnirush2api
 npm install
 npm run build
@@ -315,11 +315,15 @@ https://omnirush2api.<your-subdomain>.workers.dev/v1
 The image is multi-stage: the runtime carries **no npm dependencies** at all,
 so it stays small and starts instantly.
 
-**Build and run:**
+The daemon reads `PORT` and `HOST` from the environment, and the image sets no
+`--port` flag — so a platform that assigns its own port (Blitz, Render,
+Fly, or plain `docker run -e PORT=...`) works without any change.
+
+#### On a plain Docker host
 
 ```bash
-git clone https://github.com/bhu-alw/Omnirush2API.git
-cd Omnirush2API
+git clone https://github.com/450home/omnirush2api.git
+cd omnirush2api
 
 docker build -t omnirush2api .
 
@@ -338,21 +342,49 @@ cp .env.example .env    # then fill in your token
 docker compose up -d
 ```
 
-**Get a token inside the container:**
+#### On Blitz (or any Docker deploy platform)
+
+Blitz builds the repository's `Dockerfile` automatically. **Do not set `PORT`**
+— the platform injects its own and the container reads it.
+
+| Variable | Value | Why |
+|---|---|---|
+| `OMNIRUSH_REFRESH_TOKEN` | `omr_xxx\|omnirush-yyy` | **The only required one.** Without it no account is loaded |
+| `API_KEY` | `sk-xxxxxxxx` | Optional. Empty = no auth. Set it, or anyone with the URL burns your quota |
+| `HOST` | `0.0.0.0` | Recommended, so the proxy is reachable from outside the container |
+| `OMNIRUSH_ACCESS_TOKEN` | *(leave empty)* | Optional; the refresh half is enough |
+| `OMNIRUSH_GATEWAY_URL` | *(leave empty)* | Optional, defaults to `https://omnirush.ai/omnirush/v1` |
+| `PORT` | *(leave empty)* | **The platform assigns this.** Setting it can clash with the health probe |
+| `APPDATA` / `LOCALAPPDATA` / `XDG_CONFIG_HOME` | *(leave empty)* | No effect on Linux containers; only used when discovering OmniRush Desktop credentials. Each has a built-in default |
+
+> The deploy panel may mark several of these "required" because it sees a
+> `process.env[...]` read in the code. It does not look for fallbacks —
+> `API_KEY`, `OMNIRUSH_GATEWAY_URL`, `OMNIRUSH_ACCESS_TOKEN` and the three path
+> variables all have defaults and are safe to leave empty.
+
+Public URL after deploy: the platform gives you an HTTPS domain; append `/v1`.
+
+```
+https://<your-service-domain>/v1
+```
+
+#### Get a token
 
 ```bash
 docker run --rm -it omnirush2api node dist/cli.js login
 ```
 
-**Check it is alive:**
+#### Check it is alive
 
 ```bash
 curl http://127.0.0.1:20129/health
 curl http://127.0.0.1:20129/v1/models -H "Authorization: Bearer sk-omnirush"
 ```
 
-The `omnirush-tokens` volume keeps the rotated refresh tokens across
-container replacements — without it every restart would need a fresh login.
+The rotated refresh tokens are written to `~/.omnirush2api/tokens.json` inside
+the container. Mount a volume there (as the `docker run` and Compose examples
+above do, at `/root/.omnirush2api`) — without it, each container replacement
+loses the rotated token and needs a fresh login.
 
 ## Model Catalog & Aliases
 

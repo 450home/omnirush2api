@@ -38,12 +38,12 @@
   "license": "GPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bhu-alw/omnirush2api.git"
+    "url": "git+https://github.com/450home/omnirush2api.git"
   },
   "bugs": {
-    "url": "https://github.com/bhu-alw/omnirush2api/issues"
+    "url": "https://github.com/450home/omnirush2api/issues"
   },
-  "homepage": "https://github.com/bhu-alw/omnirush2api#readme",
+  "homepage": "https://github.com/450home/omnirush2api#readme",
   "devDependencies": {
     "@types/node": "^22.13.9",
     "esbuild": "^0.25.0",

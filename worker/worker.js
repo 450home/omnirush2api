@@ -57,7 +57,7 @@ function getModelList() {
 }
 
 // src/proxy/wire-guard.ts
-var OFFICIAL_VERSION = "2.6.7";
+var OFFICIAL_VERSION = "2.7.0";
 var BAN_PATTERNS = [
   /closed\s+automatically/i,
   /unofficial\s+client/i,

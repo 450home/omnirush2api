@@ -48,7 +48,7 @@ FROM node:22-alpine AS runtime
 
 LABEL org.opencontainers.image.title="Omnirush2API" \
       org.opencontainers.image.description="OpenAI-compatible reverse proxy for Omnirush.ai" \
-      org.opencontainers.image.source="https://github.com/bhu-alw/Omnirush2API"
+      org.opencontainers.image.source="https://github.com/450home/omnirush2api"
 
 WORKDIR /app
 ENV NODE_ENV=production
@@ -75,18 +75,21 @@ USER node
 # key as a bearer token. Without this the container would stay "unhealthy"
 # forever even though the daemon is fine.
 # It reads PORT from the environment so it still probes the right port when a
-# platform (Railway) assigns its own.
+# platform (Blitz, Railway, Render, Fly) assigns its own.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "const p=process.env.PORT||20129;fetch('http://127.0.0.1:'+p+'/health',{headers:{authorization:'Bearer '+(process.env.API_KEY||'')}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-# Gateway URL, bearer key for incoming clients, and the OAuth token pair
-# (refresh|access) can all be set as env vars.
+# Gateway URL and the bearer key for incoming clients can be set as env vars.
+#
+# PORT is deliberately NOT given a default here: Docker platforms assign
+# their own, and baking "20129" into the image risks shadowing it. The daemon
+# already falls back to 20129 in code when PORT is unset, so plain `docker run`
+# still works with no configuration.
 ENV OMNIRUSH_GATEWAY_URL="https://omnirush.ai/omnirush/v1" \
     API_KEY="sk-omnirush" \
-    PORT="20129" \
     HOST="0.0.0.0"
 
-# Do NOT hardcode --port/--host here: a platform such as Railway injects its
+# Do NOT hardcode --port/--host here: a platform such as Blitz injects its
 # own PORT, and an explicit CLI flag would override it (the daemon would then
 # listen on the wrong port and fail its health probe). The daemon reads PORT
 # and HOST from the environment, so leaving them out lets the platform win.

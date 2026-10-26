@@ -5,7 +5,8 @@ services:
     container_name: omnirush2api
     restart: unless-stopped
     ports:
-      - "20129:20129"
+      # Both sides follow ${PORT} so the mapping matches what the daemon binds.
+      - "${PORT:-20129}:${PORT:-20129}"
     environment:
       # Bearer key clients must send to the local daemon.
       API_KEY: "${API_KEY:-sk-omnirush}"
@@ -23,11 +24,12 @@ services:
       - omnirush-tokens:/root/.omnirush2api
     healthcheck:
       # /health answers 401 when API_KEY is set, so the check sends it.
+      # The probe port follows PORT so it matches what the daemon binds.
       test:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:20129/health',{headers:{authorization:'Bearer '+(process.env.API_KEY||'')}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        - "const p=process.env.PORT||20129;fetch('http://127.0.0.1:'+p+'/health',{headers:{authorization:'Bearer '+(process.env.API_KEY||'')}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       retries: 3
