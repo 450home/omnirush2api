@@ -22,6 +22,7 @@ export class RequestDispatcher {
     this.handler = new CompletionProxyHandler({
       pool,
       upstreamBaseUrl: config.gatewayUrl,
+      requestTimeoutMs: config.timeoutMs,
     });
   }
 

@@ -17,9 +17,9 @@ export interface AccountBanCheckResult {
 }
 
 // The OmniRush gateway enforces a minimum official-client version and raises
-// it over time (2.4.3 -> 2.6.7 -> 2.6.8 -> ...). This must track the current
+// it over time (2.4.3 -> 2.6.7 -> 2.7.0 -> 2.7.1 -> ...). This must track the current
 // requirement or the gateway answers "update_required".
-export const OFFICIAL_VERSION = "2.7.0";
+export const OFFICIAL_VERSION = "2.7.1";
 
 const BAN_PATTERNS: readonly RegExp[] = [
   /closed\s+automatically/i,

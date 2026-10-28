@@ -7,6 +7,7 @@ import type { ServerConfig } from "../../types/config.js";
 
 export interface StartCommandOptions {
   readonly port?: number | undefined;
+  readonly timeoutMs?: number | undefined;
   readonly host?: string | undefined;
   readonly key?: string | undefined;
   readonly gatewayUrl?: string | undefined;
@@ -21,6 +22,10 @@ export async function runStartCommand(options: StartCommandOptions = {}): Promis
   const host = options.host ?? process.env["HOST"] ?? "127.0.0.1";
   const apiKey = options.key || process.env["API_KEY"];
   const gatewayUrl = options.gatewayUrl || process.env["OMNIRUSH_GATEWAY_URL"] || DEFAULT_GATEWAY_URL;
+  // OMNIRUSH_TIMEOUT_MS raises the per-request upstream budget. The default is
+  // 120s, which the slowest models (gpt-6-astra) can exceed on their own.
+  const envTimeout = Number.parseInt(process.env["OMNIRUSH_TIMEOUT_MS"] ?? "", 10);
+  const timeoutMs = options.timeoutMs ?? (Number.isInteger(envTimeout) && envTimeout > 0 ? envTimeout : undefined);
 
   const pool = new AccountPoolManager(gatewayUrl, async (oldToken, account) => {
     try {
@@ -79,6 +84,7 @@ export async function runStartCommand(options: StartCommandOptions = {}): Promis
     host,
     apiKey,
     gatewayUrl,
+    timeoutMs,
   };
 
   const runningServer = await startHttpServer(config, pool);

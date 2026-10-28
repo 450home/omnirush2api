@@ -10,7 +10,7 @@ import {
   aggregatedToChatCompletion,
   extractSseError,
 } from "./responses-aggregator.js";
-import { createSSETransformStream } from "./stream-transformer.js";
+import { createSSETransformStream, DEFAULT_IDLE_TIMEOUT_MS } from "./stream-transformer.js";
 import { DEFAULT_GATEWAY_URL } from "../auth/oauth-client.js";
 import { createAntiBanHeaders, detectAccountBan } from "./wire-guard.js";
 
@@ -25,6 +25,11 @@ export interface ProxyHandlerOptions {
   readonly pool: AccountPoolManager;
   readonly upstreamBaseUrl?: string | undefined;
   readonly requestTimeoutMs?: number | undefined;
+  readonly idleTimeoutMs?: number | undefined;
+  /** How many full passes over the account pool to make. Default 2. */
+  readonly maxRetryRounds?: number | undefined;
+  /** Pause between rounds, honouring the gateway's `retry_after`. Default 15s. */
+  readonly retryDelayMs?: number | undefined;
 }
 
 export interface ProxyResult {
@@ -42,11 +47,17 @@ export class CompletionProxyHandler {
   private pool: AccountPoolManager;
   private upstreamBaseUrl: string;
   private requestTimeoutMs: number;
+  private idleTimeoutMs: number;
+  private maxRetryRounds: number;
+  private retryDelayMs: number;
 
   constructor(options: ProxyHandlerOptions) {
     this.pool = options.pool;
     this.upstreamBaseUrl = options.upstreamBaseUrl ?? DEFAULT_GATEWAY_URL;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
+    this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.maxRetryRounds = options.maxRetryRounds ?? 2;
+    this.retryDelayMs = options.retryDelayMs ?? 15_000;
   }
 
   /**
@@ -71,14 +82,18 @@ export class CompletionProxyHandler {
       let peeked = "";
       const peekedBytes: Uint8Array[] = [];
 
-      while (peekedBytes.length === 0 || !peeked.includes("\n\n")) {
+      // Stop only once a real `data:` line has arrived. The previous guard
+      // waited for "\n\n", which every `: queued` keep-alive comment already
+      // carries — so the poke ended on the first heartbeat and the error
+      // frame further downstream was never inspected.
+      while (!peeked.includes("data: ") && !peeked.includes("event: ")) {
         const { done, value } = await reader.read();
         if (done) break;
         if (value) {
           peekedBytes.push(value);
           peeked += decoder.decode(value, { stream: true });
         }
-        if (peeked.length > 8192) break;
+        if (peeked.length > 32768) break;
       }
 
       if (peeked.includes("event: error")) {
@@ -134,7 +149,18 @@ export class CompletionProxyHandler {
         },
       });
 
-      const transformedStream = combined.pipeThrough(createSSETransformStream(targetModel));
+      const transformedStream = combined.pipeThrough(
+        createSSETransformStream(targetModel, {
+          idleTimeoutMs: this.idleTimeoutMs,
+          onIdleTimeout: (idleMs) => {
+            this.pool.markCooldown(
+              accountId,
+              30_000,
+              `Upstream idle for ${Math.round(idleMs / 1000)}s`
+            );
+          },
+        })
+      );
       return { status: 200, isStream: true, streamResponse: transformedStream };
     }
 
@@ -234,103 +260,32 @@ export class CompletionProxyHandler {
     const targetModel = resolveModelId(request.model);
     const normalizedPayload = normalizeCompletionRequest(request);
     const isStream = request.stream === true;
-    const maxAttempts = Math.max(1, this.pool.getStats().total);
+    const accountCount = Math.max(1, this.pool.getStats().total);
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (signal?.aborted) {
-        return {
-          status: 499,
-          isStream: false,
-          errorResponse: {
-            error: { message: "Client cancelled request.", type: "client_closed_request" },
-          },
-        };
-      }
+    // A single pass over the pool is not enough when the gateway is merely
+    // overloaded: it answers `queue_timeout` with `retry_after: 15`, which
+    // means "come back shortly" rather than "you are broken". Walk the pool
+    // up to `maxRounds` times, sleeping between rounds. Every account that
+    // failed is cooling down, so by the time we loop back the short 5s
+    // cooldowns have usually expired.
+    const maxRounds = Math.max(1, this.maxRetryRounds);
+    let lastFailure: ProxyResult | null = null;
 
-      const account = await this.pool.getNextAvailableAccount();
-      if (!account) {
-        const stats = this.pool.getStats();
-        if (stats.banned > 0 && stats.active === 0) {
+    for (let round = 0; round < maxRounds; round++) {
+      if (round > 0) {
+        const slept = await this.sleepUnlessAborted(this.retryDelayMs, signal);
+        if (!slept) {
           return {
-            status: 403,
+            status: 499,
             isStream: false,
             errorResponse: {
-              error: {
-                message:
-                  "OmniRush account was closed or suspended by upstream (unofficial client / multi-session detection). Account quarantined.",
-                type: "account_suspended_error",
-                code: "account_banned_by_upstream",
-              },
+              error: { message: "Client cancelled request.", type: "client_closed_request" },
             },
           };
         }
-        return {
-          status: 429,
-          isStream: false,
-          errorResponse: {
-            error: {
-              message: "All OmniRush accounts in pool are currently in cooldown or unavailable.",
-              type: "rate_limit_error",
-              code: "all_accounts_cooling_down",
-            },
-          },
-        };
       }
 
-      const requestId = generateRequestId();
-      const gatewayUrl = (account.gatewayUrl || this.upstreamBaseUrl).replace(/\/+$/, "");
-
-      const headers = createAntiBanHeaders({
-        accessToken: account.accessToken ?? "",
-        requestId,
-        // The gateway always answers a model request as an SSE stream, and
-        // only sends the output_text.delta frames when the client asks for
-        // event-stream. A client that wanted stream:false still gets the
-        // frames and has them collapsed into one JSON body further down.
-        isStream: true,
-      });
-
-      const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
-      const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-
-      const send = async (): Promise<Response> =>
-        await this.pool.withAccountLock(account.id, async () => {
-          return await fetch(`${gatewayUrl}/responses`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(normalizedPayload),
-            signal: combinedSignal,
-          });
-        });
-
-      try {
-        let response = await send();
-
-        // The gateway rotates the access token on every refresh, so a token
-        // read from disk can already be dead when the daemon starts. Refresh
-        // this account once and retry with the fresh token.
-        if (response.status === 401) {
-          const fresh = await this.pool.refreshAccountToken(account.id);
-          if (fresh) {
-            headers["Authorization"] = `Bearer ${fresh}`;
-            response = await send();
-          }
-          if (response.status === 401) {
-            this.pool.invalidateAccountToken(account.id);
-            this.pool.markCooldown(account.id, 10_000, "HTTP 401 Unauthorized");
-            continue;
-          }
-        }
-
-        const result = await this.readUpstreamResponse(
-          response,
-          targetModel,
-          isStream,
-          account.id
-        );
-        if (result !== RETRY) return result;
-        // RETRY: this account is on cooldown now; try the next one.
-      } catch (err) {
+      for (let attempt = 0; attempt < accountCount; attempt++) {
         if (signal?.aborted) {
           return {
             status: 499,
@@ -341,14 +296,134 @@ export class CompletionProxyHandler {
           };
         }
 
-        // Network failure or timeout on this account, place on short cooldown and retry next
-        this.pool.markCooldown(
-          account.id,
-          30_000,
-          `Network error: ${err instanceof Error ? err.message : String(err)}`
-        );
+        const account = await this.pool.getNextAvailableAccount();
+        if (!account) {
+          const stats = this.pool.getStats();
+          if (stats.banned > 0 && stats.active === 0) {
+            return {
+              status: 403,
+              isStream: false,
+              errorResponse: {
+                error: {
+                  message:
+                    "OmniRush account was closed or suspended by upstream (unofficial client / multi-session detection). Account quarantined.",
+                  type: "account_suspended_error",
+                  code: "account_banned_by_upstream",
+                },
+              },
+            };
+          }
+          // Every account is cooling down. Break out of the inner loop so the
+          // outer loop can wait for the cooldown to expire before trying again.
+          break;
+        }
+
+        const requestId = generateRequestId();
+        const gatewayUrl = (account.gatewayUrl || this.upstreamBaseUrl).replace(/\/+$/, "");
+
+        const headers = createAntiBanHeaders({
+          accessToken: account.accessToken ?? "",
+          requestId,
+          // The gateway always answers a model request as an SSE stream, and
+          // only sends the output_text.delta frames when the client asks for
+          // event-stream. A client that wanted stream:false still gets the
+          // frames and has them collapsed into one JSON body further down.
+          isStream: true,
+        });
+
+        // `requestTimeoutMs` is a *connect/TTFB* budget only. The timer is
+        // cleared the moment the response headers land, so it can never cut off
+        // a body that is still streaming — AbortSignal.timeout() used to stay
+        // armed for the whole fetch lifetime, which aborted healthy long
+        // answers after 120s and cooled perfectly good accounts.
+        //
+        // Body liveness is enforced separately by the idle watchdog inside
+        // createSSETransformStream (no bytes for N seconds => fail the stream).
+        const send = async (): Promise<Response> =>
+          await this.pool.withAccountLock(account.id, async () => {
+            const connectController = new AbortController();
+            const connectTimer = setTimeout(
+              () => connectController.abort(),
+              this.requestTimeoutMs
+            );
+            // Never keep the event loop alive just for this timer.
+            if (typeof (connectTimer as { unref?: () => void }).unref === "function") {
+              (connectTimer as unknown as { unref: () => void }).unref();
+            }
+
+            const abortFromCaller = (): void => connectController.abort();
+            if (signal) {
+              if (signal.aborted) connectController.abort();
+              else signal.addEventListener("abort", abortFromCaller, { once: true });
+            }
+
+            try {
+              return await fetch(`${gatewayUrl}/responses`, {
+                method: "POST",
+                headers,
+                body: JSON.stringify(normalizedPayload),
+                signal: connectController.signal,
+              });
+            } finally {
+              // Headers arrived (or the attempt failed): the connect budget is
+              // spent. From here on only the idle watchdog judges liveness.
+              clearTimeout(connectTimer);
+            }
+          });
+
+        try {
+          let response = await send();
+
+          if (response.status === 401) {
+            const fresh = await this.pool.refreshAccountToken(account.id);
+            if (fresh) {
+              headers["Authorization"] = `Bearer ${fresh}`;
+              response = await send();
+            }
+            if (response.status === 401) {
+              this.pool.invalidateAccountToken(account.id);
+              this.pool.markCooldown(account.id, 10_000, "HTTP 401 Unauthorized");
+              continue;
+            }
+          }
+
+          const result = await this.readUpstreamResponse(
+            response,
+            targetModel,
+            isStream,
+            account.id
+          );
+          if (result !== RETRY) return result;
+          // RETRY: this account is on cooldown now; try the next one.
+        } catch (err) {
+          if (signal?.aborted) {
+            return {
+              status: 499,
+              isStream: false,
+              errorResponse: {
+                error: { message: "Client cancelled request.", type: "client_closed_request" },
+              },
+            };
+          }
+
+          // Distinguish "slow" from "broken". A connect timeout means the
+          // account could not reach the gateway in time — a short pause is
+          // enough. Any other network error gets the normal cooldown.
+          const isAbort = err instanceof Error && err.name === "AbortError";
+          this.pool.markCooldown(
+            account.id,
+            isAbort ? 5_000 : 30_000,
+            isAbort
+              ? `Connect timeout after ${Math.round(this.requestTimeoutMs / 1000)}s`
+              : `Network error: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
       }
     }
+
+    // Nothing came back after every round. Report the most informative of the
+    // reasons we collected instead of a generic 502.
+    if (lastFailure !== null) return lastFailure;
 
     return {
       status: 502,
@@ -360,5 +435,26 @@ export class CompletionProxyHandler {
         },
       },
     };
+  }
+
+  /**
+   * Sleeps for `ms`, returning false early if the client goes away.
+   */
+  private sleepUnlessAborted(ms: number, signal?: AbortSignal | undefined): Promise<boolean> {
+    if (ms <= 0) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve(true);
+      }, ms);
+      if (typeof (timer as { unref?: () => void }).unref === "function") {
+        (timer as unknown as { unref: () => void }).unref();
+      }
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 }

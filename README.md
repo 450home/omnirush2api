@@ -329,7 +329,7 @@ docker build -t omnirush2api .
 
 docker run -d --name omnirush2api \
   -p 20129:20129 \
-  -v omnirush-tokens:/root/.omnirush2api \
+  -v omnirush-tokens:/home/node/.omnirush2api \
   -e API_KEY=sk-omnirush \
   -e OMNIRUSH_REFRESH_TOKEN="omr_xxx|omnirush-yyy" \
   omnirush2api
@@ -383,7 +383,7 @@ curl http://127.0.0.1:20129/v1/models -H "Authorization: Bearer sk-omnirush"
 
 The rotated refresh tokens are written to `~/.omnirush2api/tokens.json` inside
 the container. Mount a volume there (as the `docker run` and Compose examples
-above do, at `/root/.omnirush2api`) — without it, each container replacement
+above do, at `/home/node/.omnirush2api`) — without it, each container replacement
 loses the rotated token and needs a fresh login.
 
 ## Model Catalog & Aliases
@@ -1167,7 +1167,7 @@ docker compose up -d
 
 ```bash
 docker run -d --name omnirush2api -p 20129:20129 \
-  -v omnirush-tokens:/root/.omnirush2api \
+  -v omnirush-tokens:/home/node/.omnirush2api \
   -e API_KEY=sk-omnirush \
   -e OMNIRUSH_REFRESH_TOKEN="omr_xxx|omnirush-yyy" \
   -e PORT=20129 \

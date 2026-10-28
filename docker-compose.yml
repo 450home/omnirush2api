@@ -21,7 +21,9 @@ services:
     volumes:
       # Rotated refresh tokens are persisted here; keep the volume so the
       # account survives a container replacement.
-      - omnirush-tokens:/root/.omnirush2api
+      # NOTE: /home/node, not /root - the container runs as USER node and
+      # the token store is $HOME/.omnirush2api.
+      - omnirush-tokens:/home/node/.omnirush2api
     healthcheck:
       # /health answers 401 when API_KEY is set, so the check sends it.
       # The probe port follows PORT so it matches what the daemon binds.

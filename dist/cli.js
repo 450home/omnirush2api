@@ -63,7 +63,7 @@ function getModelList() {
 }
 
 // src/proxy/wire-guard.ts
-var OFFICIAL_VERSION = "2.7.0";
+var OFFICIAL_VERSION = "2.7.1";
 var BAN_PATTERNS = [
   /closed\s+automatically/i,
   /unofficial\s+client/i,
@@ -786,7 +786,7 @@ function transformUpstreamChunk(upstream, requestedModel) {
       error: { message, type: "upstream_error" }
     };
   }
-  if (typeof upstream["delta"] === "string") {
+  if (eventType.endsWith(".output_text.delta") && typeof upstream["delta"] === "string") {
     return createChunkDelta({
       id,
       model: requestedModel,
@@ -800,12 +800,89 @@ function formatSSEChunk(chunk) {
 
 `;
 }
-function createSSETransformStream(requestedModel) {
+function rescueTruncatedDelta(raw) {
+  const start = raw.search(/"delta"\s*:\s*"/);
+  if (start === -1) return null;
+  let i = raw.indexOf('"', raw.indexOf(":", start)) + 1;
+  let out = "";
+  while (i < raw.length) {
+    const ch = raw[i];
+    if (ch === "\\") {
+      const next = raw[i + 1];
+      if (next === void 0) break;
+      switch (next) {
+        case "n":
+          out += "\n";
+          break;
+        case "t":
+          out += "	";
+          break;
+        case "r":
+          out += "\r";
+          break;
+        case "b":
+          out += "\b";
+          break;
+        case "f":
+          out += "\f";
+          break;
+        case '"':
+          out += '"';
+          break;
+        case "\\":
+          out += "\\";
+          break;
+        case "/":
+          out += "/";
+          break;
+        case "u": {
+          const hex = raw.slice(i + 2, i + 6);
+          if (hex.length < 4) return out.length > 0 ? out : null;
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 4;
+          break;
+        }
+        default:
+          out += next;
+      }
+      i += 2;
+      continue;
+    }
+    if (ch === '"') break;
+    out += ch;
+    i += 1;
+  }
+  return out.length > 0 ? out : null;
+}
+var DEFAULT_IDLE_TIMEOUT_MS = 3e4;
+function createSSETransformStream(requestedModel, options) {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
+  const idleTimeoutMs = options?.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   let buffer = "";
+  let lastByteAt = Date.now();
+  let finished = false;
+  let watchdog;
   return new TransformStream({
+    start(controller) {
+      if (idleTimeoutMs <= 0) return;
+      const tick = Math.min(5e3, Math.max(1e3, Math.floor(idleTimeoutMs / 6)));
+      watchdog = setInterval(() => {
+        if (finished) return;
+        const idleMs = Date.now() - lastByteAt;
+        if (idleMs >= idleTimeoutMs) {
+          finished = true;
+          if (watchdog !== void 0) clearInterval(watchdog);
+          options?.onIdleTimeout?.(idleMs);
+          controller.error(new Error(`Upstream stalled: no data for ${Math.round(idleMs / 1e3)}s`));
+        }
+      }, tick);
+      if (typeof watchdog.unref === "function") {
+        watchdog.unref();
+      }
+    },
     transform(chunk, controller) {
+      lastByteAt = Date.now();
       buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
@@ -833,8 +910,25 @@ function createSSETransformStream(requestedModel) {
           if (transformed !== null) {
             controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
           }
+        } else {
+          const rescued = rescueTruncatedDelta(buffer);
+          if (rescued !== null) {
+            controller.enqueue(
+              encoder.encode(
+                formatSSEChunk(
+                  createChunkDelta({
+                    id: `chatcmpl-${Date.now()}`,
+                    model: requestedModel,
+                    content: rescued
+                  })
+                )
+              )
+            );
+          }
         }
       }
+      finished = true;
+      if (watchdog !== void 0) clearInterval(watchdog);
       controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
     }
   });
@@ -972,10 +1066,16 @@ var CompletionProxyHandler = class {
   pool;
   upstreamBaseUrl;
   requestTimeoutMs;
+  idleTimeoutMs;
+  maxRetryRounds;
+  retryDelayMs;
   constructor(options) {
     this.pool = options.pool;
     this.upstreamBaseUrl = options.upstreamBaseUrl ?? DEFAULT_GATEWAY_URL;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 12e4;
+    this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.maxRetryRounds = options.maxRetryRounds ?? 2;
+    this.retryDelayMs = options.retryDelayMs ?? 15e3;
   }
   /**
    * Turns an upstream response into a client answer.
@@ -989,14 +1089,14 @@ var CompletionProxyHandler = class {
       const decoder = new TextDecoder();
       let peeked = "";
       const peekedBytes = [];
-      while (peekedBytes.length === 0 || !peeked.includes("\n\n")) {
+      while (!peeked.includes("data: ") && !peeked.includes("event: ")) {
         const { done, value } = await reader.read();
         if (done) break;
         if (value) {
           peekedBytes.push(value);
           peeked += decoder.decode(value, { stream: true });
         }
-        if (peeked.length > 8192) break;
+        if (peeked.length > 32768) break;
       }
       if (peeked.includes("event: error")) {
         await reader.cancel().catch(() => void 0);
@@ -1046,7 +1146,18 @@ var CompletionProxyHandler = class {
           })();
         }
       });
-      const transformedStream = combined.pipeThrough(createSSETransformStream(targetModel));
+      const transformedStream = combined.pipeThrough(
+        createSSETransformStream(targetModel, {
+          idleTimeoutMs: this.idleTimeoutMs,
+          onIdleTimeout: (idleMs) => {
+            this.pool.markCooldown(
+              accountId,
+              3e4,
+              `Upstream idle for ${Math.round(idleMs / 1e3)}s`
+            );
+          }
+        })
+      );
       return { status: 200, isStream: true, streamResponse: transformedStream };
     }
     const responseText = await response.text();
@@ -1120,88 +1231,23 @@ var CompletionProxyHandler = class {
     const targetModel = resolveModelId(request.model);
     const normalizedPayload = normalizeCompletionRequest(request);
     const isStream = request.stream === true;
-    const maxAttempts = Math.max(1, this.pool.getStats().total);
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (signal?.aborted) {
-        return {
-          status: 499,
-          isStream: false,
-          errorResponse: {
-            error: { message: "Client cancelled request.", type: "client_closed_request" }
-          }
-        };
-      }
-      const account = await this.pool.getNextAvailableAccount();
-      if (!account) {
-        const stats = this.pool.getStats();
-        if (stats.banned > 0 && stats.active === 0) {
+    const accountCount = Math.max(1, this.pool.getStats().total);
+    const maxRounds = Math.max(1, this.maxRetryRounds);
+    let lastFailure = null;
+    for (let round = 0; round < maxRounds; round++) {
+      if (round > 0) {
+        const slept = await this.sleepUnlessAborted(this.retryDelayMs, signal);
+        if (!slept) {
           return {
-            status: 403,
+            status: 499,
             isStream: false,
             errorResponse: {
-              error: {
-                message: "OmniRush account was closed or suspended by upstream (unofficial client / multi-session detection). Account quarantined.",
-                type: "account_suspended_error",
-                code: "account_banned_by_upstream"
-              }
+              error: { message: "Client cancelled request.", type: "client_closed_request" }
             }
           };
         }
-        return {
-          status: 429,
-          isStream: false,
-          errorResponse: {
-            error: {
-              message: "All OmniRush accounts in pool are currently in cooldown or unavailable.",
-              type: "rate_limit_error",
-              code: "all_accounts_cooling_down"
-            }
-          }
-        };
       }
-      const requestId = generateRequestId();
-      const gatewayUrl = (account.gatewayUrl || this.upstreamBaseUrl).replace(/\/+$/, "");
-      const headers = createAntiBanHeaders({
-        accessToken: account.accessToken ?? "",
-        requestId,
-        // The gateway always answers a model request as an SSE stream, and
-        // only sends the output_text.delta frames when the client asks for
-        // event-stream. A client that wanted stream:false still gets the
-        // frames and has them collapsed into one JSON body further down.
-        isStream: true
-      });
-      const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
-      const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-      const send = async () => await this.pool.withAccountLock(account.id, async () => {
-        return await fetch(`${gatewayUrl}/responses`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(normalizedPayload),
-          signal: combinedSignal
-        });
-      });
-      try {
-        let response = await send();
-        if (response.status === 401) {
-          const fresh = await this.pool.refreshAccountToken(account.id);
-          if (fresh) {
-            headers["Authorization"] = `Bearer ${fresh}`;
-            response = await send();
-          }
-          if (response.status === 401) {
-            this.pool.invalidateAccountToken(account.id);
-            this.pool.markCooldown(account.id, 1e4, "HTTP 401 Unauthorized");
-            continue;
-          }
-        }
-        const result = await this.readUpstreamResponse(
-          response,
-          targetModel,
-          isStream,
-          account.id
-        );
-        if (result !== RETRY) return result;
-      } catch (err) {
+      for (let attempt = 0; attempt < accountCount; attempt++) {
         if (signal?.aborted) {
           return {
             status: 499,
@@ -1211,13 +1257,101 @@ var CompletionProxyHandler = class {
             }
           };
         }
-        this.pool.markCooldown(
-          account.id,
-          3e4,
-          `Network error: ${err instanceof Error ? err.message : String(err)}`
-        );
+        const account = await this.pool.getNextAvailableAccount();
+        if (!account) {
+          const stats = this.pool.getStats();
+          if (stats.banned > 0 && stats.active === 0) {
+            return {
+              status: 403,
+              isStream: false,
+              errorResponse: {
+                error: {
+                  message: "OmniRush account was closed or suspended by upstream (unofficial client / multi-session detection). Account quarantined.",
+                  type: "account_suspended_error",
+                  code: "account_banned_by_upstream"
+                }
+              }
+            };
+          }
+          break;
+        }
+        const requestId = generateRequestId();
+        const gatewayUrl = (account.gatewayUrl || this.upstreamBaseUrl).replace(/\/+$/, "");
+        const headers = createAntiBanHeaders({
+          accessToken: account.accessToken ?? "",
+          requestId,
+          // The gateway always answers a model request as an SSE stream, and
+          // only sends the output_text.delta frames when the client asks for
+          // event-stream. A client that wanted stream:false still gets the
+          // frames and has them collapsed into one JSON body further down.
+          isStream: true
+        });
+        const send = async () => await this.pool.withAccountLock(account.id, async () => {
+          const connectController = new AbortController();
+          const connectTimer = setTimeout(
+            () => connectController.abort(),
+            this.requestTimeoutMs
+          );
+          if (typeof connectTimer.unref === "function") {
+            connectTimer.unref();
+          }
+          const abortFromCaller = () => connectController.abort();
+          if (signal) {
+            if (signal.aborted) connectController.abort();
+            else signal.addEventListener("abort", abortFromCaller, { once: true });
+          }
+          try {
+            return await fetch(`${gatewayUrl}/responses`, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(normalizedPayload),
+              signal: connectController.signal
+            });
+          } finally {
+            clearTimeout(connectTimer);
+          }
+        });
+        try {
+          let response = await send();
+          if (response.status === 401) {
+            const fresh = await this.pool.refreshAccountToken(account.id);
+            if (fresh) {
+              headers["Authorization"] = `Bearer ${fresh}`;
+              response = await send();
+            }
+            if (response.status === 401) {
+              this.pool.invalidateAccountToken(account.id);
+              this.pool.markCooldown(account.id, 1e4, "HTTP 401 Unauthorized");
+              continue;
+            }
+          }
+          const result = await this.readUpstreamResponse(
+            response,
+            targetModel,
+            isStream,
+            account.id
+          );
+          if (result !== RETRY) return result;
+        } catch (err) {
+          if (signal?.aborted) {
+            return {
+              status: 499,
+              isStream: false,
+              errorResponse: {
+                error: { message: "Client cancelled request.", type: "client_closed_request" }
+              }
+            };
+          }
+          const isAbort = err instanceof Error && err.name === "AbortError";
+          this.pool.markCooldown(
+            account.id,
+            isAbort ? 5e3 : 3e4,
+            isAbort ? `Connect timeout after ${Math.round(this.requestTimeoutMs / 1e3)}s` : `Network error: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
       }
     }
+    if (lastFailure !== null) return lastFailure;
     return {
       status: 502,
       isStream: false,
@@ -1228,6 +1362,26 @@ var CompletionProxyHandler = class {
         }
       }
     };
+  }
+  /**
+   * Sleeps for `ms`, returning false early if the client goes away.
+   */
+  sleepUnlessAborted(ms, signal) {
+    if (ms <= 0) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve(true);
+      }, ms);
+      if (typeof timer.unref === "function") {
+        timer.unref();
+      }
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 };
 
@@ -1246,7 +1400,8 @@ var RequestDispatcher = class {
     this.pool = pool;
     this.handler = new CompletionProxyHandler({
       pool,
-      upstreamBaseUrl: config.gatewayUrl
+      upstreamBaseUrl: config.gatewayUrl,
+      requestTimeoutMs: config.timeoutMs
     });
   }
   async dispatch(req, res) {
@@ -1655,6 +1810,8 @@ async function runStartCommand(options = {}) {
   const host = options.host ?? process.env["HOST"] ?? "127.0.0.1";
   const apiKey = options.key || process.env["API_KEY"];
   const gatewayUrl = options.gatewayUrl || process.env["OMNIRUSH_GATEWAY_URL"] || DEFAULT_GATEWAY_URL;
+  const envTimeout = Number.parseInt(process.env["OMNIRUSH_TIMEOUT_MS"] ?? "", 10);
+  const timeoutMs = options.timeoutMs ?? (Number.isInteger(envTimeout) && envTimeout > 0 ? envTimeout : void 0);
   const pool = new AccountPoolManager(gatewayUrl, async (oldToken, account) => {
     try {
       await addOrUpdateToken(
@@ -1701,7 +1858,8 @@ async function runStartCommand(options = {}) {
     port,
     host,
     apiKey,
-    gatewayUrl
+    gatewayUrl,
+    timeoutMs
   };
   const runningServer = await startHttpServer(config, pool);
   const shutdown = async () => {
@@ -1974,6 +2132,8 @@ function parseArgs(args) {
       options["host"] = args[++i];
     } else if (arg === "-k" || arg === "--key") {
       options["key"] = args[++i];
+    } else if (arg === "--timeout") {
+      options["timeoutMs"] = parseInt(args[++i] ?? "0", 10);
     } else if (arg === "--gateway-url") {
       options["gatewayUrl"] = args[++i];
     } else if (arg === "--token") {

@@ -43,7 +43,7 @@ describe("anti-ban wire guard & ban protection", () => {
       assert.ok(!val.toLowerCase().includes("omnirush2api"), `Header value leaked unofficial name: ${val}`);
     }
 
-    // Required official client signatures (matching omnirush@2.7.0 token-proxy.js)
+    // Required official client signatures (matching omnirush@2.7.1 token-proxy.js)
     assert.equal(headers["User-Agent"], "omnirush");
     assert.equal(headers["X-OmniRush-Client"], `cli/${OFFICIAL_VERSION}`);
     // A made-up x-omnirush-session-id is refused by the gateway with 403,

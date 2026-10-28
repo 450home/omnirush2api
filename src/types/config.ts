@@ -38,6 +38,7 @@ export interface HealthStatusResponse {
 
 export interface CliOptions {
   readonly port?: number | undefined;
+  readonly timeoutMs?: number | undefined;
   readonly host?: string | undefined;
   readonly key?: string | undefined;
   readonly gatewayUrl?: string | undefined;

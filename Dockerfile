@@ -5,7 +5,7 @@
 # Run:
 #   docker run -d --name omnirush2api \
 #     -p 20129:20129 \
-#     -v omnirush-tokens:/root/.omnirush2api \
+#     -v omnirush-tokens:/home/node/.omnirush2api \
 #     -e API_KEY=sk-omnirush \
 #     -e OMNIRUSH_REFRESH_TOKEN="<refresh>|<access>" \
 #     omnirush2api
@@ -53,17 +53,25 @@ LABEL org.opencontainers.image.title="Omnirush2API" \
 WORKDIR /app
 ENV NODE_ENV=production
 
-# Run unprivileged.
-RUN mkdir -p /root/.omnirush2api && chown -R node:node /app /root/.omnirush2api
+# Run unprivileged. HOME must point at a directory the unprivileged user can
+# write: the token store resolves to $HOME/.omnirush2api (see
+# src/auth/token-store.ts:getDefaultTokenStorePath), so keeping /root here would
+# make every rotated-refresh-token write fail with EACCES and the container would
+# silently fall back to the (already invalidated) token from the environment on
+# the next restart.
+ENV HOME=/home/node
+RUN mkdir -p /home/node/.omnirush2api && chown -R node:node /app /home/node
 
 # The prebuilt bundle plus the metadata the daemon prints on start.
 COPY --from=builder --chown=node:node /app/dist ./dist
 COPY --from=builder --chown=node:node /app/worker ./worker
 COPY --chown=node:node package.json README.md ./
 
-# Where the daemon stores rotated refresh tokens. Mount a volume here so the
-# tokens survive a container replacement.
-VOLUME ["/root/.omnirush2api"]
+# Where the daemon stores rotated refresh tokens ($HOME/.omnirush2api).
+# Mount a volume here so the tokens survive a container replacement. Docker
+# initialises a fresh named volume with the ownership of the image directory,
+# so node:node is preserved; a host directory mount needs the same owner.
+VOLUME ["/home/node/.omnirush2api"]
 
 # 20129 is the default daemon port (OpenAI-compatible base URL:
 # http://127.0.0.1:20129/v1)

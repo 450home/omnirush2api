@@ -62,6 +62,8 @@ function parseArgs(args: string[]): { command: string; options: CliOptions; extr
       options["host"] = args[++i];
     } else if (arg === "-k" || arg === "--key") {
       options["key"] = args[++i];
+    } else if (arg === "--timeout") {
+      options["timeoutMs"] = parseInt(args[++i] ?? "0", 10);
     } else if (arg === "--gateway-url") {
       options["gatewayUrl"] = args[++i];
     } else if (arg === "--token") {
