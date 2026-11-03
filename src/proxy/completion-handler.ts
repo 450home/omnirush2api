@@ -11,6 +11,13 @@ import {
   extractSseError,
 } from "./responses-aggregator.js";
 import { createSSETransformStream, DEFAULT_IDLE_TIMEOUT_MS } from "./stream-transformer.js";
+import {
+  cooldownFromQueue,
+  formatQueueStatus,
+  isQueueTimeoutCode,
+  parseQueueStatus,
+  type QueueStatus,
+} from "./queue-status.js";
 import { DEFAULT_GATEWAY_URL } from "../auth/oauth-client.js";
 import { createAntiBanHeaders, detectAccountBan } from "./wire-guard.js";
 
@@ -96,15 +103,38 @@ export class CompletionProxyHandler {
         if (peeked.length > 32768) break;
       }
 
+      // Remember the last queue position/ETA seen while waiting, so a queue
+      // timeout can be parked for exactly as long as upstream asked instead
+      // of being treated as a broken account.
+      let queueStatus: QueueStatus | null = null;
+      for (const line of peeked.split("\n")) {
+        const snapshot = parseQueueStatus(line);
+        if (snapshot) queueStatus = snapshot;
+      }
+
       if (peeked.includes("event: error")) {
         await reader.cancel().catch(() => undefined);
-        this.pool.markCooldown(
+        const sseError = extractSseError(peeked);
+        this.penalizeUpstreamFailure(accountId, sseError?.code, sseError?.message, queueStatus);
+        return RETRY;
+      }
+
+      // A 200 with an empty body is not a successful answer. It happens when
+      // the upstream drops the connection right after the headers. This
+      // used to reach the client as a valid 200 carrying nothing, so the user
+      // saw a blank reply after waiting a full minute.
+      if (peeked.trim() === "") {
+        await reader.cancel().catch(() => undefined);
+        this.penalizeUpstreamFailure(
           accountId,
-          5_000,
-          `Upstream SSE error: ${extractSseError(peeked)?.code ?? "unknown"}`
+          "upstream_empty_body",
+          "Upstream returned 200 with an empty body",
+          queueStatus
         );
         return RETRY;
       }
+
+      this.pool.clearQueue(accountId);
 
       const replay = new ReadableStream<Uint8Array>({
         start(controller) {
@@ -159,6 +189,12 @@ export class CompletionProxyHandler {
               `Upstream idle for ${Math.round(idleMs / 1000)}s`
             );
           },
+          onQueueStatus: (status) => {
+            this.pool.recordQueueStatus(accountId, status);
+          },
+          onAdmitted: () => {
+            this.pool.clearQueue(accountId);
+          },
         })
       );
       return { status: 200, isStream: true, streamResponse: transformedStream };
@@ -179,13 +215,26 @@ export class CompletionProxyHandler {
       // gateway does this when its backend is overloaded). Retry the request
       // instead of returning an empty answer.
       if (agg.error) {
-        this.pool.markCooldown(
+        this.penalizeUpstreamFailure(
           accountId,
-          5_000,
-          `Upstream SSE error: ${agg.errorCode ?? "unknown"}`
+          agg.errorCode ?? undefined,
+          agg.error,
+          this.lastQueueSnapshot(responseText)
         );
         return RETRY;
       }
+      // Same guard as the streaming path: a 200 whose body produced no text
+      // at all is a dropped connection, not an answer.
+      if (agg.text.trim() === "" && agg.reasoning.trim() === "") {
+        this.penalizeUpstreamFailure(
+          accountId,
+          "upstream_empty_body",
+          "Upstream returned 200 with no output text",
+          this.lastQueueSnapshot(responseText)
+        );
+        return RETRY;
+      }
+      this.pool.clearQueue(accountId);
       return {
         status: 200,
         isStream: false,
@@ -241,6 +290,52 @@ export class CompletionProxyHandler {
         error: { message: `Gateway error (${response.status})`, type: "gateway_error" },
       },
     };
+  }
+
+  /**
+   * Finds the last `: queued position=N eta=M` snapshot in a body we already
+   * received in full (non-streaming path).
+   */
+  private lastQueueSnapshot(body: string): QueueStatus | null {
+    let latest: QueueStatus | null = null;
+    for (const line of body.split("\n")) {
+      const snapshot = parseQueueStatus(line);
+      if (snapshot) latest = snapshot;
+    }
+    return latest;
+  }
+
+  /**
+   * Applies the right penalty for an upstream failure.
+   *
+   * A queue timeout is not an account fault: the account is healthy, it just
+   * waited too long for its turn. Parking it for upstream's own ETA stops it
+   * from being re-queued in a loop, while a genuinely broken upstream error
+   * only gets the short cooldown it used to have.
+   */
+  private penalizeUpstreamFailure(
+    accountId: string,
+    code: string | undefined,
+    message: string | undefined,
+    queueStatus: QueueStatus | null
+  ): void {
+    if (isQueueTimeoutCode(code) || isQueueTimeoutCode(message)) {
+      const cooldownMs = cooldownFromQueue(queueStatus);
+      this.pool.markQueue(
+        queueStatus ?? { position: undefined, etaSeconds: undefined, at: Date.now() },
+        accountId,
+        cooldownMs
+      );
+      console.warn(
+        `[omnirush2api Queue] ${accountId} queue timeout (${formatQueueStatus(queueStatus)}); parked ${Math.round(cooldownMs / 1000)}s instead of counting it as an account fault.`
+      );
+      return;
+    }
+
+    if (queueStatus) {
+      this.pool.markQueue(queueStatus, accountId);
+    }
+    this.pool.markCooldown(accountId, 5_000, `Upstream SSE error: ${code ?? "unknown"}`);
   }
 
   public async handleCompletion(
@@ -299,7 +394,7 @@ export class CompletionProxyHandler {
         const account = await this.pool.getNextAvailableAccount();
         if (!account) {
           const stats = this.pool.getStats();
-          if (stats.banned > 0 && stats.active === 0) {
+          if (stats.banned > 0 && stats.active === 0 && stats.busy === 0) {
             return {
               status: 403,
               isStream: false,
@@ -309,6 +404,23 @@ export class CompletionProxyHandler {
                     "OmniRush account was closed or suspended by upstream (unofficial client / multi-session detection). Account quarantined.",
                   type: "account_suspended_error",
                   code: "account_banned_by_upstream",
+                },
+              },
+            };
+          }
+          // A dead refresh token is permanent. Reporting it as "all accounts
+          // cooling down" made a re-login look like a one-minute queue, which
+          // is exactly the symptom that wasted hours of debugging.
+          if (stats.active === 0 && stats.busy === 0 && stats.needsReauth > 0) {
+            return {
+              status: 401,
+              isStream: false,
+              errorResponse: {
+                error: {
+                  message:
+                    "OmniRush refresh token was rejected by upstream (refresh_token_invalid_or_expired). Re-login required: run `npm run login`, then POST /admin/reload-tokens.",
+                  type: "invalid_token",
+                  code: "refresh_token_invalid_or_expired",
                 },
               },
             };
@@ -410,6 +522,28 @@ export class CompletionProxyHandler {
           // account could not reach the gateway in time — a short pause is
           // enough. Any other network error gets the normal cooldown.
           const isAbort = err instanceof Error && err.name === "AbortError";
+
+          // The account was still waiting in the upstream queue when the call
+          // gave up: park it for upstream's own ETA instead of counting a
+          // healthy account as broken.
+          const observed = this.pool.getAccount(account.id);
+          if (isAbort && observed?.queuePosition !== undefined) {
+            const cooldownMs = cooldownFromQueue({
+              position: observed.queuePosition,
+              etaSeconds: observed.queueEtaSeconds,
+              at: observed.queueObservedAt ?? Date.now(),
+            });
+            console.warn(
+              `[omnirush2api Queue] ${account.id} aborted while queued (position=${observed.queuePosition} eta=${observed.queueEtaSeconds ?? "?"}s); parked ${Math.round(cooldownMs / 1000)}s.`
+            );
+            this.pool.markCooldown(
+              account.id,
+              cooldownMs,
+              "Upstream queue: aborted while queued"
+            );
+            continue;
+          }
+
           this.pool.markCooldown(
             account.id,
             isAbort ? 5_000 : 30_000,

@@ -188,6 +188,15 @@ async function refreshDeviceToken(refreshToken, options = {}) {
 
 // src/auth/pool-manager.ts
 var DEFAULT_COOLDOWN_MS = 36e5;
+var PERMANENT_REFRESH_FAILURES = [
+  /refresh_token_invalid_or_expired/i,
+  /invalid_grant/i,
+  /refresh token.*(?:invalid|expired|revoked)/i
+];
+function isPermanentRefreshFailure(error) {
+  if (!error) return false;
+  return PERMANENT_REFRESH_FAILURES.some((re) => re.test(error));
+}
 function parseCooldownDuration(retryAfterHeader, bodyText) {
   if (retryAfterHeader && retryAfterHeader.trim() !== "") {
     const seconds = parseInt(retryAfterHeader.trim(), 10);
@@ -303,11 +312,14 @@ var AccountPoolManager = class {
       resolveLock = res;
     });
     this.locks.set(accountId, lockPromise);
+    const locked = this.accounts.find((a) => a.id === accountId);
+    if (locked) locked.inFlight = true;
     try {
       return await fn();
     } finally {
       this.locks.delete(accountId);
       resolveLock();
+      if (locked) locked.inFlight = false;
     }
   }
   /**
@@ -329,11 +341,102 @@ var AccountPoolManager = class {
   markCooldown(accountId, durationMs, reason) {
     const account = this.accounts.find((a) => a.id === accountId);
     if (!account || account.isBanned) return;
-    account.cooldownUntil = Date.now() + durationMs;
+    const next = Date.now() + durationMs;
+    account.cooldownUntil = Math.max(account.cooldownUntil, next);
     account.failureCount++;
     console.warn(
       `[omnirush2api Pool] Account ${account.id} placed in cooldown for ${Math.round(durationMs / 1e3)}s: ${reason ?? "Rate limit / Quota reached"}`
     );
+  }
+  /** Records a queue snapshot without touching the cooldown. */
+  recordQueueStatus(accountId, status) {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    account.queuePosition = status.position;
+    account.queueEtaSeconds = status.etaSeconds;
+    account.queueObservedAt = status.at;
+  }
+  /**
+   * Records a queue snapshot and optionally parks the account until upstream's
+   * own ETA, so it is not hammered back into the queue while still waiting.
+   */
+  markQueue(status, accountId, cooldownMs) {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    account.queuePosition = status.position;
+    account.queueEtaSeconds = status.etaSeconds;
+    account.queueObservedAt = status.at;
+    if (cooldownMs !== void 0 && cooldownMs > 0) {
+      this.markCooldown(
+        accountId,
+        cooldownMs,
+        `Upstream queue: position=${status.position ?? "?"} eta=${status.etaSeconds ?? "?"}s`
+      );
+    }
+  }
+  /** Clears the queue snapshot once the request got admitted. */
+  clearQueue(accountId) {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    account.queuePosition = void 0;
+    account.queueEtaSeconds = void 0;
+    account.queueObservedAt = void 0;
+  }
+  /**
+   * Quarantines an account whose refresh token can never work again.
+   *
+   * Kept separate from `markBanned` (upstream closure/suspension): the account
+   * itself is fine, the local credential is dead, and the fix is a new login.
+   */
+  markNeedsReauth(accountId, reason) {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    account.needsReauth = true;
+    account.accessToken = null;
+    account.expiresAt = 0;
+    account.cooldownUntil = Number.MAX_SAFE_INTEGER;
+    console.error(
+      `[omnirush2api Pool] \u{1F511} Account ${account.id} refresh token is dead (${reason ?? "unknown"}). Re-login required: run \`npm run login\` and restart, or POST /admin/reload-tokens.`
+    );
+  }
+  /** Re-arms an account after a successful re-login / token reload. */
+  clearReauth(accountId) {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    account.needsReauth = false;
+    account.cooldownUntil = 0;
+    account.failureCount = 0;
+  }
+  getAccount(accountId) {
+    return this.accounts.find((a) => a.id === accountId);
+  }
+  /**
+   * Replaces the whole account list from a fresh token file.
+   *
+   * Used by `POST /admin/reload-tokens` so a re-login does not require a
+   * restart: restarting while another instance still holds the same refresh
+   * token is exactly how tokens get rotated out from under each other.
+   */
+  replaceAccounts(entries) {
+    const previous = new Map(this.accounts.map((a) => [a.refreshToken, a]));
+    const next = [];
+    entries.forEach((entry, index) => {
+      const old = previous.get(entry.refreshToken);
+      next.push({
+        id: old?.id ?? `account-${index + 1}`,
+        refreshToken: entry.refreshToken,
+        accessToken: entry.accessToken ?? null,
+        gatewayUrl: entry.gatewayUrl || this.defaultGatewayUrl,
+        expiresAt: 0,
+        cooldownUntil: 0,
+        failureCount: 0,
+        lastUsedAt: 0,
+        email: entry.email
+      });
+    });
+    this.accounts = next;
+    this.currentIndex = 0;
+    return next.length;
   }
   /**
    * Selects the next available ready account via round-robin, refreshing tokens if needed
@@ -345,8 +448,11 @@ var AccountPoolManager = class {
     for (let i = 0; i < total; i++) {
       const idx = (this.currentIndex + i) % total;
       const candidate = this.accounts[idx];
-      if (!candidate || candidate.isBanned) continue;
+      if (!candidate || candidate.isBanned || candidate.needsReauth) continue;
       if (now < candidate.cooldownUntil) {
+        continue;
+      }
+      if (candidate.inFlight) {
         continue;
       }
       if (candidate.accessToken === null || isTokenExpired(candidate.expiresAt)) {
@@ -376,6 +482,8 @@ var AccountPoolManager = class {
           const banCheck = detectAccountBan(403, refreshResult.error ?? "");
           if (banCheck.isBanned) {
             this.markBanned(candidate.id, banCheck.reason ?? refreshResult.error);
+          } else if (isPermanentRefreshFailure(refreshResult.error)) {
+            this.markNeedsReauth(candidate.id, refreshResult.error);
           } else {
             this.markCooldown(candidate.id, 6e4, refreshResult.error);
           }
@@ -396,11 +504,17 @@ var AccountPoolManager = class {
     let active = 0;
     let inCooldown = 0;
     let banned = 0;
+    let busy = 0;
+    let needsReauth = 0;
     for (const account of this.accounts) {
       if (account.isBanned) {
         banned++;
+      } else if (account.needsReauth) {
+        needsReauth++;
       } else if (now < account.cooldownUntil) {
         inCooldown++;
+      } else if (account.inFlight) {
+        busy++;
       } else {
         active++;
       }
@@ -409,8 +523,36 @@ var AccountPoolManager = class {
       total: this.accounts.length,
       active,
       inCooldown,
-      banned
+      banned,
+      busy,
+      needsReauth
     };
+  }
+  /**
+   * Per-account view for /health: which account is doing what, and where it
+   * stands in the upstream queue.
+   */
+  getDiagnostics() {
+    const now = Date.now();
+    return this.accounts.map((account) => {
+      let status = "active";
+      if (account.isBanned) status = "banned";
+      else if (account.needsReauth) status = "needs_reauth";
+      else if (now < account.cooldownUntil) status = "cooldown";
+      else if (account.inFlight) status = "in_flight";
+      const queue = account.queuePosition !== void 0 ? `position=${account.queuePosition} eta=${account.queueEtaSeconds ?? "?"}s observed ${Math.max(0, Math.round((now - (account.queueObservedAt ?? now)) / 1e3))}s ago` : "not queued";
+      return {
+        id: account.id,
+        email: account.email,
+        accessToken: account.accessToken ? `${account.accessToken.slice(0, 12)}\u2026` : null,
+        status,
+        cooldownRemainingMs: Math.max(0, account.cooldownUntil - now),
+        lastUsedAt: account.lastUsedAt,
+        failureCount: account.failureCount,
+        queue,
+        bannedReason: account.bannedReason
+      };
+    });
   }
   invalidateAccountToken(accountId) {
     const account = this.accounts.find((a) => a.id === accountId);
@@ -434,7 +576,11 @@ var AccountPoolManager = class {
       gatewayUrl: account.gatewayUrl
     });
     if (!refreshResult.success || !refreshResult.accessToken) {
-      this.markCooldown(account.id, 6e4, refreshResult.error ?? "Token refresh failed");
+      if (isPermanentRefreshFailure(refreshResult.error)) {
+        this.markNeedsReauth(account.id, refreshResult.error);
+      } else {
+        this.markCooldown(account.id, 6e4, refreshResult.error ?? "Token refresh failed");
+      }
       return null;
     }
     account.accessToken = refreshResult.accessToken;
@@ -552,6 +698,48 @@ function normalizeCompletionResponse(raw, fallbackModel) {
     choices,
     ...usage ? { usage } : {}
   };
+}
+
+// src/proxy/queue-status.ts
+var QUEUE_RE = /queued\b[^\r\n]*?position=(\d+)[^\r\n]*?eta=(\d+)/i;
+var COMMENT_PREFIX = ":";
+function isSseComment(line) {
+  return line.trimStart().startsWith(COMMENT_PREFIX);
+}
+function parseQueueStatus(line) {
+  if (!isSseComment(line)) return null;
+  const match = QUEUE_RE.exec(line);
+  if (!match) return null;
+  const position = Number.parseInt(match[1] ?? "", 10);
+  const etaSeconds = Number.parseInt(match[2] ?? "", 10);
+  if (!Number.isFinite(position) || !Number.isFinite(etaSeconds)) return null;
+  return { position, etaSeconds, at: Date.now() };
+}
+function formatQueueStatus(status) {
+  if (!status) return "not queued";
+  const pos = status.position ?? "?";
+  const eta = status.etaSeconds ?? "?";
+  return `position=${pos} eta=${eta}s`;
+}
+function cooldownFromQueue(status, options = {}) {
+  const minMs = options.minMs ?? 5e3;
+  const maxMs = options.maxMs ?? 12e4;
+  const padMs = options.padMs ?? 5e3;
+  const etaMs = (status?.etaSeconds ?? 0) * 1e3;
+  const target = etaMs + padMs;
+  return Math.min(maxMs, Math.max(minMs, target));
+}
+var QUEUE_TIMEOUT_CODES = /* @__PURE__ */ new Set([
+  "omni_queue_timeout",
+  "queue_timeout",
+  "queue_full",
+  "upstream_queue_timeout"
+]);
+function isQueueTimeoutCode(code) {
+  if (!code) return false;
+  const normalized = code.trim().toLowerCase();
+  if (QUEUE_TIMEOUT_CODES.has(normalized)) return true;
+  return normalized.includes("queue");
 }
 
 // src/proxy/stream-transformer.ts
@@ -734,7 +922,32 @@ function createSSETransformStream(requestedModel, options) {
   let buffer = "";
   let lastByteAt = Date.now();
   let finished = false;
+  let admitted = false;
   let watchdog;
+  const handleLine = (line, controller) => {
+    const queueStatus = parseQueueStatus(line);
+    if (queueStatus) {
+      options?.onQueueStatus?.(queueStatus);
+      return false;
+    }
+    if (isSseComment(line)) return false;
+    const parsed = parseSSELine(line);
+    if (parsed === "[DONE]") {
+      controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
+      return true;
+    }
+    if (parsed !== null) {
+      if (!admitted) {
+        admitted = true;
+        options?.onAdmitted?.();
+      }
+      const transformed = transformUpstreamChunk(parsed, requestedModel);
+      if (transformed !== null) {
+        controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
+      }
+    }
+    return false;
+  };
   return new TransformStream({
     start(controller) {
       if (idleTimeoutMs <= 0) return;
@@ -759,43 +972,28 @@ function createSSETransformStream(requestedModel, options) {
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       for (const line of lines) {
-        const parsed = parseSSELine(line);
-        if (parsed === "[DONE]") {
-          controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
-          return;
-        }
-        if (parsed !== null) {
-          const transformed = transformUpstreamChunk(parsed, requestedModel);
-          if (transformed !== null) {
-            controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
-          }
-        }
+        if (handleLine(line, controller)) return;
       }
     },
     flush(controller) {
       if (buffer.trim()) {
-        const parsed = parseSSELine(buffer);
-        if (parsed === "[DONE]") {
-          controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
-        } else if (parsed !== null) {
-          const transformed = transformUpstreamChunk(parsed, requestedModel);
-          if (transformed !== null) {
-            controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
-          }
-        } else {
-          const rescued = rescueTruncatedDelta(buffer);
-          if (rescued !== null) {
-            controller.enqueue(
-              encoder.encode(
-                formatSSEChunk(
-                  createChunkDelta({
-                    id: `chatcmpl-${Date.now()}`,
-                    model: requestedModel,
-                    content: rescued
-                  })
+        if (!handleLine(buffer, controller)) {
+          const parsed = parseSSELine(buffer);
+          if (parsed === null && !isSseComment(buffer)) {
+            const rescued = rescueTruncatedDelta(buffer);
+            if (rescued !== null) {
+              controller.enqueue(
+                encoder.encode(
+                  formatSSEChunk(
+                    createChunkDelta({
+                      id: `chatcmpl-${Date.now()}`,
+                      model: requestedModel,
+                      content: rescued
+                    })
+                  )
                 )
-              )
-            );
+              );
+            }
           }
         }
       }
@@ -970,15 +1168,28 @@ var CompletionProxyHandler = class {
         }
         if (peeked.length > 32768) break;
       }
+      let queueStatus = null;
+      for (const line of peeked.split("\n")) {
+        const snapshot = parseQueueStatus(line);
+        if (snapshot) queueStatus = snapshot;
+      }
       if (peeked.includes("event: error")) {
         await reader.cancel().catch(() => void 0);
-        this.pool.markCooldown(
+        const sseError = extractSseError(peeked);
+        this.penalizeUpstreamFailure(accountId, sseError?.code, sseError?.message, queueStatus);
+        return RETRY;
+      }
+      if (peeked.trim() === "") {
+        await reader.cancel().catch(() => void 0);
+        this.penalizeUpstreamFailure(
           accountId,
-          5e3,
-          `Upstream SSE error: ${extractSseError(peeked)?.code ?? "unknown"}`
+          "upstream_empty_body",
+          "Upstream returned 200 with an empty body",
+          queueStatus
         );
         return RETRY;
       }
+      this.pool.clearQueue(accountId);
       const replay = new ReadableStream({
         start(controller) {
           for (const chunk of peekedBytes) controller.enqueue(chunk);
@@ -1027,6 +1238,12 @@ var CompletionProxyHandler = class {
               3e4,
               `Upstream idle for ${Math.round(idleMs / 1e3)}s`
             );
+          },
+          onQueueStatus: (status) => {
+            this.pool.recordQueueStatus(accountId, status);
+          },
+          onAdmitted: () => {
+            this.pool.clearQueue(accountId);
           }
         })
       );
@@ -1036,13 +1253,24 @@ var CompletionProxyHandler = class {
     if (response.ok && (responseText.trimStart().startsWith("event:") || responseText.includes("data:"))) {
       const agg = aggregateResponsesSse(responseText, targetModel);
       if (agg.error) {
-        this.pool.markCooldown(
+        this.penalizeUpstreamFailure(
           accountId,
-          5e3,
-          `Upstream SSE error: ${agg.errorCode ?? "unknown"}`
+          agg.errorCode ?? void 0,
+          agg.error,
+          this.lastQueueSnapshot(responseText)
         );
         return RETRY;
       }
+      if (agg.text.trim() === "" && agg.reasoning.trim() === "") {
+        this.penalizeUpstreamFailure(
+          accountId,
+          "upstream_empty_body",
+          "Upstream returned 200 with no output text",
+          this.lastQueueSnapshot(responseText)
+        );
+        return RETRY;
+      }
+      this.pool.clearQueue(accountId);
       return {
         status: 200,
         isStream: false,
@@ -1090,6 +1318,44 @@ var CompletionProxyHandler = class {
       }
     };
   }
+  /**
+   * Finds the last `: queued position=N eta=M` snapshot in a body we already
+   * received in full (non-streaming path).
+   */
+  lastQueueSnapshot(body) {
+    let latest = null;
+    for (const line of body.split("\n")) {
+      const snapshot = parseQueueStatus(line);
+      if (snapshot) latest = snapshot;
+    }
+    return latest;
+  }
+  /**
+   * Applies the right penalty for an upstream failure.
+   *
+   * A queue timeout is not an account fault: the account is healthy, it just
+   * waited too long for its turn. Parking it for upstream's own ETA stops it
+   * from being re-queued in a loop, while a genuinely broken upstream error
+   * only gets the short cooldown it used to have.
+   */
+  penalizeUpstreamFailure(accountId, code, message, queueStatus) {
+    if (isQueueTimeoutCode(code) || isQueueTimeoutCode(message)) {
+      const cooldownMs = cooldownFromQueue(queueStatus);
+      this.pool.markQueue(
+        queueStatus ?? { position: void 0, etaSeconds: void 0, at: Date.now() },
+        accountId,
+        cooldownMs
+      );
+      console.warn(
+        `[omnirush2api Queue] ${accountId} queue timeout (${formatQueueStatus(queueStatus)}); parked ${Math.round(cooldownMs / 1e3)}s instead of counting it as an account fault.`
+      );
+      return;
+    }
+    if (queueStatus) {
+      this.pool.markQueue(queueStatus, accountId);
+    }
+    this.pool.markCooldown(accountId, 5e3, `Upstream SSE error: ${code ?? "unknown"}`);
+  }
   async handleCompletion(request, signal) {
     if (signal?.aborted) {
       return {
@@ -1132,7 +1398,7 @@ var CompletionProxyHandler = class {
         const account = await this.pool.getNextAvailableAccount();
         if (!account) {
           const stats = this.pool.getStats();
-          if (stats.banned > 0 && stats.active === 0) {
+          if (stats.banned > 0 && stats.active === 0 && stats.busy === 0) {
             return {
               status: 403,
               isStream: false,
@@ -1141,6 +1407,19 @@ var CompletionProxyHandler = class {
                   message: "OmniRush account was closed or suspended by upstream (unofficial client / multi-session detection). Account quarantined.",
                   type: "account_suspended_error",
                   code: "account_banned_by_upstream"
+                }
+              }
+            };
+          }
+          if (stats.active === 0 && stats.busy === 0 && stats.needsReauth > 0) {
+            return {
+              status: 401,
+              isStream: false,
+              errorResponse: {
+                error: {
+                  message: "OmniRush refresh token was rejected by upstream (refresh_token_invalid_or_expired). Re-login required: run `npm run login`, then POST /admin/reload-tokens.",
+                  type: "invalid_token",
+                  code: "refresh_token_invalid_or_expired"
                 }
               }
             };
@@ -1215,6 +1494,23 @@ var CompletionProxyHandler = class {
             };
           }
           const isAbort = err instanceof Error && err.name === "AbortError";
+          const observed = this.pool.getAccount(account.id);
+          if (isAbort && observed?.queuePosition !== void 0) {
+            const cooldownMs = cooldownFromQueue({
+              position: observed.queuePosition,
+              etaSeconds: observed.queueEtaSeconds,
+              at: observed.queueObservedAt ?? Date.now()
+            });
+            console.warn(
+              `[omnirush2api Queue] ${account.id} aborted while queued (position=${observed.queuePosition} eta=${observed.queueEtaSeconds ?? "?"}s); parked ${Math.round(cooldownMs / 1e3)}s.`
+            );
+            this.pool.markCooldown(
+              account.id,
+              cooldownMs,
+              "Upstream queue: aborted while queued"
+            );
+            continue;
+          }
           this.pool.markCooldown(
             account.id,
             isAbort ? 5e3 : 3e4,

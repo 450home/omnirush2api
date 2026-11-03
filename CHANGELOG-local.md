@@ -4,6 +4,71 @@
 
 ---
 
+## 2026-11-03 · 修复 5+6+7：排队解析、空正文重试、必需重认证
+
+**问题现象**
+
+1. 单账号 `gpt-6-sol` 实测三次：冷启动 74.61s（首字节 73.45s）、间隔 10s 后 61.66s 但零帧空正文、间隔 45s 后 32.71s。首次请求排队 ≥1 分钟，全为上游队列时间，但代理对此毫无感知，客户端只看到长时间静默。
+2. 空正文那次，代理认为请求成功并正常结束，客户端拿到空消息。
+3. 旧 token 全部 401 `refresh_token_invalid_or_expired`，代理却对外返回 429 `all_accounts_cooling_down`，误导排查方向。
+4. 启动参数 `--api-key` 不被识别，health 里 `api_key_configured: false`，正确参数是 `--key`。
+
+**修改内容**
+
+新增 `src/proxy/queue-status.ts`（87 行）
+
+- `isSseComment(line)`：识别 `: queued position=N eta=M` 形式的 SSE 注释帧
+- `parseQueueStatus(line)`：解析出 `position` / `eta`
+- `cooldownFromQueue(status)`：按 ETA+5s 换算冷却，下限 5s、上限 120s（防 `position=98 eta=0` 的假数据把账号关一小时）
+- `isQueueTimeoutCode(code)`：识别排队超时类错误码
+
+`src/auth/pool-manager.ts`（+210）
+
+- `isPermanentRefreshFailure()`：命中 `refresh_token_invalid_or_expired` / `invalid_grant` / `refresh token.*(invalid|expired|revoked)` → `markNeedsReauth()`，`cooldownUntil = Number.MAX_SAFE_INTEGER`
+- `markCooldown` 改为 `Math.max` 语义，只延长不缩短
+- `getNextAvailableAccount()` 跳过 `inFlight` 账号
+- 新增 `recordQueueStatus` / `markQueue` / `clearQueue` / `markNeedsReauth` / `clearReauth` / `getDiagnostics` / `replaceAccounts`
+- `getStats()` 增加 `busy`、`needsReauth`，与 cooling 互斥计数
+
+`src/proxy/completion-handler.ts`（+148）
+
+- `penalizeUpstreamFailure()` 分流：排队超时按 ETA 停账号、不计故障；真故障仍罚 5s
+- `lastQueueSnapshot()` 读取最后一次排队快照
+- 空正文判定为 `upstream_empty_body` 并重试
+- 预览循环条件改为 `while (!peeked.includes("data: ") && !peeked.includes("event: "))`，预算从 8KB 提到 32_768 字节
+
+`src/proxy/stream-transformer.ts`（+97/-）
+
+- `SSETransformOptions` 增加 `onQueueStatus?` / `onAdmitted?`
+- 新增 `handleLine()`，队列注释帧不转发给客户端，`[DONE]` 语义不变
+
+`src/server/routes.ts`（+75）
+
+- 新增 `/admin/queue-status` 与诊断输出
+- `/admin/reload-tokens` 支持热替换账号（实测 `reloaded:1`）
+
+`src/types/auth.ts`（+8）
+
+- `AccountState` 增加 `queue` / `needsReauth` 字段
+
+`dist/cli.js`（85.3KB）与 `worker/worker.js`（57.3KB）已重建。
+
+**验证**
+
+- `npx tsc --noEmit` 无错
+- `npm test` 48/48
+- diffstat：7 文件 +1311/-222
+- 端到端实测**尚未进行**：旧实例 PID 1658（`--port 20991 --api-key qtest`，跑的是旧代码）已于 2026-11-03 用 SIGTERM 停掉，新代码待启动实测
+
+**待实测项**
+
+- 首次排队时长是否因队列感知而改善
+- 空正文是否被 `upstream_empty_body` 捕获并重试
+- refresh token 失效是否返回 401 而非 429
+- health 中 `api_key_configured` 是否为 true（必须用 `--key` 启动）
+
+---
+
 ## 2026-10-28 · 修复 4：流式空闲超时（idle timeout）替代总时长超时
 
 **问题现象**

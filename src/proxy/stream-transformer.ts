@@ -2,6 +2,7 @@ import type {
   ChatCompletionChunk,
   ChatCompletionChunkChoice,
 } from "../types/openai.js";
+import { isSseComment, parseQueueStatus, type QueueStatus } from "./queue-status.js";
 
 export const SSE_DONE_MESSAGE = "data: [DONE]\n\n";
 
@@ -240,6 +241,10 @@ export interface SSETransformOptions {
   readonly idleTimeoutMs?: number;
   /** Called when the idle watchdog fires, so the caller can cool the account. */
   readonly onIdleTimeout?: (idleMs: number) => void;
+  /** Called for every `: queued position=N eta=M` keep-alive comment. */
+  readonly onQueueStatus?: (status: QueueStatus) => void;
+  /** Called the first time a real (non-comment) frame arrives, i.e. admitted. */
+  readonly onAdmitted?: () => void;
 }
 
 export const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
@@ -254,7 +259,44 @@ export function createSSETransformStream(
   let buffer = "";
   let lastByteAt = Date.now();
   let finished = false;
+  let admitted = false;
   let watchdog: ReturnType<typeof setInterval> | undefined;
+
+  /**
+   * Handles one complete SSE line. Returns true when `[DONE]` was reached and
+   * the caller should stop consuming.
+   */
+  const handleLine = (
+    line: string,
+    controller: TransformStreamDefaultController<Uint8Array>
+  ): boolean => {
+    // Queue telemetry rides on SSE comments. Surface it instead of dropping
+    // it, so the pool knows the real position/ETA rather than guessing.
+    const queueStatus = parseQueueStatus(line);
+    if (queueStatus) {
+      options?.onQueueStatus?.(queueStatus);
+      return false;
+    }
+    if (isSseComment(line)) return false;
+
+    const parsed = parseSSELine(line);
+    if (parsed === "[DONE]") {
+      controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
+      return true;
+    }
+
+    if (parsed !== null) {
+      if (!admitted) {
+        admitted = true;
+        options?.onAdmitted?.();
+      }
+      const transformed = transformUpstreamChunk(parsed, requestedModel);
+      if (transformed !== null) {
+        controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
+      }
+    }
+    return false;
+  };
 
   return new TransformStream<Uint8Array, Uint8Array>({
     start(controller) {
@@ -286,47 +328,30 @@ export function createSSETransformStream(
       buffer = lines.pop() ?? "";
 
       for (const line of lines) {
-        const parsed = parseSSELine(line);
-        if (parsed === "[DONE]") {
-          controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
-          return;
-        }
-
-        if (parsed !== null) {
-          const transformed = transformUpstreamChunk(parsed, requestedModel);
-          if (transformed !== null) {
-            controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
-          }
-        }
+        if (handleLine(line, controller)) return;
       }
     },
     flush(controller) {
       if (buffer.trim()) {
-        const parsed = parseSSELine(buffer);
-        if (parsed === "[DONE]") {
-          controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
-        } else if (parsed !== null) {
-          const transformed = transformUpstreamChunk(parsed, requestedModel);
-          if (transformed !== null) {
-            controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
-          }
-        } else {
-          // The stream was cut mid-line, so `buffer` is a truncated JSON
-          // object that JSON.parse cannot handle. Rescue the text that was
-          // already there instead of dropping it silently.
-          const rescued = rescueTruncatedDelta(buffer);
-          if (rescued !== null) {
-            controller.enqueue(
-              encoder.encode(
-                formatSSEChunk(
-                  createChunkDelta({
-                    id: `chatcmpl-${Date.now()}`,
-                    model: requestedModel,
-                    content: rescued,
-                  })
+        if (!handleLine(buffer, controller)) {
+          // handleLine only reports `[DONE]`; a `null` return here means the
+          // line did not parse, i.e. the stream was cut mid-JSON.
+          const parsed = parseSSELine(buffer);
+          if (parsed === null && !isSseComment(buffer)) {
+            const rescued = rescueTruncatedDelta(buffer);
+            if (rescued !== null) {
+              controller.enqueue(
+                encoder.encode(
+                  formatSSEChunk(
+                    createChunkDelta({
+                      id: `chatcmpl-${Date.now()}`,
+                      model: requestedModel,
+                      content: rescued,
+                    })
+                  )
                 )
-              )
-            );
+              );
+            }
           }
         }
       }

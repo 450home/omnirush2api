@@ -4,6 +4,7 @@ import type { ChatCompletionRequest } from "../types/openai.js";
 import { getModelList } from "../proxy/model-catalog.js";
 import { CompletionProxyHandler } from "../proxy/completion-handler.js";
 import type { AccountPoolManager } from "../auth/pool-manager.js";
+import { loadStoredTokens } from "../auth/token-store.js";
 
 const CORS_HEADERS: Readonly<Record<string, string>> = {
   "Access-Control-Allow-Origin": "*",
@@ -77,6 +78,17 @@ export class RequestDispatcher {
       return;
     }
 
+    // Route: POST /admin/reload-tokens
+    //
+    // Re-reads ~/.omnirush2api/tokens.json into the running pool. After a
+    // re-login this avoids a restart — and a restart is exactly how two
+    // instances end up rotating the same refresh token out from under each
+    // other.
+    if (req.method === "POST" && pathname === "/admin/reload-tokens") {
+      await this.handleReloadTokens(res);
+      return;
+    }
+
     // Fallback: 404 Not Found
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(
@@ -95,25 +107,86 @@ export class RequestDispatcher {
     const isBanned = stats.total > 0 && stats.banned === stats.total;
     const isDegraded = stats.total > 0 && stats.active === 0;
     const isUnhealthy = stats.total === 0;
+    const needsReauth = stats.needsReauth > 0;
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify(
         {
-          status: isBanned ? "banned" : isUnhealthy ? "unhealthy" : isDegraded ? "degraded" : "healthy",
+          status: isBanned
+            ? "banned"
+            : isUnhealthy
+              ? "unhealthy"
+              : needsReauth && stats.active === 0
+                ? "reauth_required"
+                : isDegraded
+                  ? "degraded"
+                  : "healthy",
           version: "1.0.1",
           mode: "local-daemon",
           api_key_configured: Boolean(this.config.apiKey),
           account_count: stats.total,
           active_accounts: stats.active,
+          busy_accounts: stats.busy,
           cooldown_accounts: stats.inCooldown,
           banned_accounts: stats.banned,
+          reauth_required_accounts: stats.needsReauth,
+          // Which account is doing what, and where it stands in the upstream
+          // queue. Tokens are truncated to 12 chars — never the full value.
+          accounts: this.pool.getDiagnostics(),
           supported_models: ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol"],
         },
         null,
         2
       )
     );
+  }
+
+  private async handleReloadTokens(res: ServerResponse): Promise<void> {
+    try {
+      const entries = await loadStoredTokens();
+      if (entries.length === 0) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: {
+              message:
+                "No tokens found. Run `npm run login` first, then retry this endpoint.",
+              type: "invalid_request_error",
+              code: "no_tokens_on_disk",
+            },
+          })
+        );
+        return;
+      }
+
+      const count = this.pool.replaceAccounts(entries);
+      console.log(
+        `[omnirush2api Admin] Reloaded ${count} token(s) from disk; accounts reset and re-armed.`
+      );
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          {
+            reloaded: count,
+            accounts: this.pool.getDiagnostics(),
+          },
+          null,
+          2
+        )
+      );
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: {
+            message: `Reload failed: ${err instanceof Error ? err.message : String(err)}`,
+            type: "internal_error",
+          },
+        })
+      );
+    }
   }
 
   private handleModels(res: ServerResponse): void {

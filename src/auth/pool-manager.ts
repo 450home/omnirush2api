@@ -1,8 +1,28 @@
 import type { AccountState } from "../types/auth.js";
 import { isTokenExpired, refreshDeviceToken, DEFAULT_GATEWAY_URL } from "./oauth-client.js";
 import { detectAccountBan } from "../proxy/wire-guard.js";
+import type { QueueStatus } from "../proxy/queue-status.js";
 
 const DEFAULT_COOLDOWN_MS = 3_600_000; // 1 hour
+
+/**
+ * Upstream error strings that mean "this refresh token will never work again".
+ *
+ * A rejected refresh token is permanent: retrying it only burns the pool and
+ * makes every client look like it is waiting in a queue. Such an account is
+ * quarantined and flagged `needsReauth` so the answer is "log in again",
+ * not "wait 60 seconds".
+ */
+const PERMANENT_REFRESH_FAILURES: readonly RegExp[] = [
+  /refresh_token_invalid_or_expired/i,
+  /invalid_grant/i,
+  /refresh token.*(?:invalid|expired|revoked)/i,
+];
+
+export function isPermanentRefreshFailure(error: string | undefined | null): boolean {
+  if (!error) return false;
+  return PERMANENT_REFRESH_FAILURES.some((re) => re.test(error));
+}
 
 /**
  * Extracts cooldown duration in milliseconds from HTTP response headers or body
@@ -40,6 +60,20 @@ export interface PoolStats {
   readonly active: number;
   readonly inCooldown: number;
   readonly banned: number;
+  readonly busy: number;
+  readonly needsReauth: number;
+}
+
+export interface AccountDiagnostics {
+  readonly id: string;
+  readonly email?: string | undefined;
+  readonly accessToken: string | null;
+  readonly status: "active" | "in_flight" | "cooldown" | "banned" | "needs_reauth";
+  readonly cooldownRemainingMs: number;
+  readonly lastUsedAt: number;
+  readonly failureCount: number;
+  readonly queue: string;
+  readonly bannedReason?: string | undefined;
 }
 
 export type TokenRotatedCallback = (
@@ -188,12 +222,15 @@ export class AccountPoolManager {
       resolveLock = res;
     });
     this.locks.set(accountId, lockPromise);
+    const locked = this.accounts.find((a) => a.id === accountId);
+    if (locked) locked.inFlight = true;
 
     try {
       return await fn();
     } finally {
       this.locks.delete(accountId);
       resolveLock();
+      if (locked) locked.inFlight = false;
     }
   }
 
@@ -219,11 +256,123 @@ export class AccountPoolManager {
     const account = this.accounts.find((a) => a.id === accountId);
     if (!account || account.isBanned) return;
 
-    account.cooldownUntil = Date.now() + durationMs;
+    // Never shrink an existing cooldown: a short failure that lands while the
+    // account is already parked must not put it back into the rotation early.
+    const next = Date.now() + durationMs;
+    account.cooldownUntil = Math.max(account.cooldownUntil, next);
     account.failureCount++;
     console.warn(
       `[omnirush2api Pool] Account ${account.id} placed in cooldown for ${Math.round(durationMs / 1000)}s: ${reason ?? "Rate limit / Quota reached"}`
     );
+  }
+
+  /** Records a queue snapshot without touching the cooldown. */
+  public recordQueueStatus(accountId: string, status: QueueStatus): void {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    account.queuePosition = status.position;
+    account.queueEtaSeconds = status.etaSeconds;
+    account.queueObservedAt = status.at;
+  }
+
+  /**
+   * Records a queue snapshot and optionally parks the account until upstream's
+   * own ETA, so it is not hammered back into the queue while still waiting.
+   */
+  public markQueue(status: QueueStatus, accountId: string, cooldownMs?: number): void {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+
+    account.queuePosition = status.position;
+    account.queueEtaSeconds = status.etaSeconds;
+    account.queueObservedAt = status.at;
+
+    if (cooldownMs !== undefined && cooldownMs > 0) {
+      this.markCooldown(
+        accountId,
+        cooldownMs,
+        `Upstream queue: position=${status.position ?? "?"} eta=${status.etaSeconds ?? "?"}s`
+      );
+    }
+  }
+
+  /** Clears the queue snapshot once the request got admitted. */
+  public clearQueue(accountId: string): void {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    account.queuePosition = undefined;
+    account.queueEtaSeconds = undefined;
+    account.queueObservedAt = undefined;
+  }
+
+  /**
+   * Quarantines an account whose refresh token can never work again.
+   *
+   * Kept separate from `markBanned` (upstream closure/suspension): the account
+   * itself is fine, the local credential is dead, and the fix is a new login.
+   */
+  public markNeedsReauth(accountId: string, reason?: string): void {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+
+    account.needsReauth = true;
+    account.accessToken = null;
+    account.expiresAt = 0;
+    account.cooldownUntil = Number.MAX_SAFE_INTEGER;
+    console.error(
+      `[omnirush2api Pool] 🔑 Account ${account.id} refresh token is dead (${reason ?? "unknown"}). Re-login required: run \`npm run login\` and restart, or POST /admin/reload-tokens.`
+    );
+  }
+
+  /** Re-arms an account after a successful re-login / token reload. */
+  public clearReauth(accountId: string): void {
+    const account = this.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    account.needsReauth = false;
+    account.cooldownUntil = 0;
+    account.failureCount = 0;
+  }
+
+  public getAccount(accountId: string): AccountState | undefined {
+    return this.accounts.find((a) => a.id === accountId);
+  }
+
+  /**
+   * Replaces the whole account list from a fresh token file.
+   *
+   * Used by `POST /admin/reload-tokens` so a re-login does not require a
+   * restart: restarting while another instance still holds the same refresh
+   * token is exactly how tokens get rotated out from under each other.
+   */
+  public replaceAccounts(
+    entries: readonly {
+      readonly refreshToken: string;
+      readonly accessToken?: string | undefined;
+      readonly gatewayUrl?: string | undefined;
+      readonly email?: string | undefined;
+    }[]
+  ): number {
+    const previous = new Map(this.accounts.map((a) => [a.refreshToken, a]));
+    const next: AccountState[] = [];
+
+    entries.forEach((entry, index) => {
+      const old = previous.get(entry.refreshToken);
+      next.push({
+        id: old?.id ?? `account-${index + 1}`,
+        refreshToken: entry.refreshToken,
+        accessToken: entry.accessToken ?? null,
+        gatewayUrl: entry.gatewayUrl || this.defaultGatewayUrl,
+        expiresAt: 0,
+        cooldownUntil: 0,
+        failureCount: 0,
+        lastUsedAt: 0,
+        email: entry.email,
+      });
+    });
+
+    this.accounts = next;
+    this.currentIndex = 0;
+    return next.length;
   }
 
   /**
@@ -237,9 +386,16 @@ export class AccountPoolManager {
     for (let i = 0; i < total; i++) {
       const idx = (this.currentIndex + i) % total;
       const candidate = this.accounts[idx];
-      if (!candidate || candidate.isBanned) continue;
+      if (!candidate || candidate.isBanned || candidate.needsReauth) continue;
 
       if (now < candidate.cooldownUntil) {
+        continue;
+      }
+
+      // An account already serving a request is skipped: `withAccountLock`
+      // would otherwise serialize the new request behind it, and the client
+      // would wait for a queue it never asked for.
+      if (candidate.inFlight) {
         continue;
       }
 
@@ -277,6 +433,10 @@ export class AccountPoolManager {
           const banCheck = detectAccountBan(403, refreshResult.error ?? "");
           if (banCheck.isBanned) {
             this.markBanned(candidate.id, banCheck.reason ?? refreshResult.error);
+          } else if (isPermanentRefreshFailure(refreshResult.error)) {
+            // Permanent: a 60s cooldown only makes the client look stuck in a
+            // queue. Quarantine the account and ask for a re-login.
+            this.markNeedsReauth(candidate.id, refreshResult.error);
           } else {
             this.markCooldown(candidate.id, 60_000, refreshResult.error);
           }
@@ -300,12 +460,18 @@ export class AccountPoolManager {
     let active = 0;
     let inCooldown = 0;
     let banned = 0;
+    let busy = 0;
+    let needsReauth = 0;
 
     for (const account of this.accounts) {
       if (account.isBanned) {
         banned++;
+      } else if (account.needsReauth) {
+        needsReauth++;
       } else if (now < account.cooldownUntil) {
         inCooldown++;
+      } else if (account.inFlight) {
+        busy++;
       } else {
         active++;
       }
@@ -316,7 +482,41 @@ export class AccountPoolManager {
       active,
       inCooldown,
       banned,
+      busy,
+      needsReauth,
     };
+  }
+
+  /**
+   * Per-account view for /health: which account is doing what, and where it
+   * stands in the upstream queue.
+   */
+  public getDiagnostics(): readonly AccountDiagnostics[] {
+    const now = Date.now();
+    return this.accounts.map((account) => {
+      let status: AccountDiagnostics["status"] = "active";
+      if (account.isBanned) status = "banned";
+      else if (account.needsReauth) status = "needs_reauth";
+      else if (now < account.cooldownUntil) status = "cooldown";
+      else if (account.inFlight) status = "in_flight";
+
+      const queue =
+        account.queuePosition !== undefined
+          ? `position=${account.queuePosition} eta=${account.queueEtaSeconds ?? "?"}s observed ${Math.max(0, Math.round((now - (account.queueObservedAt ?? now)) / 1000))}s ago`
+          : "not queued";
+
+      return {
+        id: account.id,
+        email: account.email,
+        accessToken: account.accessToken ? `${account.accessToken.slice(0, 12)}…` : null,
+        status,
+        cooldownRemainingMs: Math.max(0, account.cooldownUntil - now),
+        lastUsedAt: account.lastUsedAt,
+        failureCount: account.failureCount,
+        queue,
+        bannedReason: account.bannedReason,
+      };
+    });
   }
 
   public invalidateAccountToken(accountId: string): void {
@@ -344,7 +544,11 @@ export class AccountPoolManager {
     });
 
     if (!refreshResult.success || !refreshResult.accessToken) {
-      this.markCooldown(account.id, 60_000, refreshResult.error ?? "Token refresh failed");
+      if (isPermanentRefreshFailure(refreshResult.error)) {
+        this.markNeedsReauth(account.id, refreshResult.error);
+      } else {
+        this.markCooldown(account.id, 60_000, refreshResult.error ?? "Token refresh failed");
+      }
       return null;
     }
 

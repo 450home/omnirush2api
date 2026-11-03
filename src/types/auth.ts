@@ -63,6 +63,14 @@ export interface AccountState {
   email?: string | undefined;
   isBanned?: boolean | undefined;
   bannedReason?: string | undefined;
+  /** Set when the refresh token itself was rejected: only a re-login fixes it. */
+  needsReauth?: boolean | undefined;
+  /** True while a client request is in flight on this account. */
+  inFlight?: boolean | undefined;
+  /** Last observed upstream queue snapshot (`: queued position=N eta=M`). */
+  queuePosition?: number | undefined;
+  queueEtaSeconds?: number | undefined;
+  queueObservedAt?: number | undefined;
 }
 
 export interface DiscoveredCredential {
